@@ -16,7 +16,8 @@ pub use chunk::{
 };
 pub use error::Error;
 pub use index::{
-    clamp_k, fit_dim, format_hits, is_inside, require_index_outside_vault, Hit, Index, Plan, Stamp,
+    clamp_k, fit_dim, format_hits, is_inside, limit_model_text, require_index_outside_vault, Hit,
+    Index, Plan, Stamp, MODEL_RESULT_CHARS,
 };
 pub use ipc::{roundtrip, IpcHit, IpcRequest, IpcResponse};
 pub use prefix::{document_prefix, query_prefix};

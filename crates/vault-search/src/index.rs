@@ -251,6 +251,10 @@ pub fn fit_dim(mut vector: Vec<f32>, dim: usize) -> Result<Vec<f32>, Error> {
     Ok(vector)
 }
 
+/// Character budget for text pasted into the chat model. About 1,000 tokens,
+/// so one tool result cannot fill an 8,192-token window.
+pub const MODEL_RESULT_CHARS: usize = 4_000;
+
 pub fn format_hits(hits: &[Hit]) -> String {
     if hits.is_empty() {
         return "No matching notes.".to_string();
@@ -271,6 +275,49 @@ pub fn format_hits(hits: &[Hit]) -> String {
         out.push_str(&format!("score: {:.3}\n", hit.score));
         out.push_str(&hit.text);
         out.push('\n');
+    }
+    out
+}
+
+/// Keep whole hits while they fit. A result that is still too long is cut, and
+/// the model is told that later matches were left out.
+pub fn limit_model_text(text: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(200);
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let note = "\n\nFurther matches omitted so this result does not fill the context window.\n";
+    let budget = max_chars.saturating_sub(note.chars().count());
+    let parts: Vec<&str> = text.split("\n---\n").collect();
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for part in &parts {
+        let sep = if shown == 0 { 0 } else { 5 };
+        let part_len = part.chars().count();
+        if used + sep + part_len <= budget {
+            if shown > 0 {
+                out.push_str("\n---\n");
+            }
+            out.push_str(part);
+            used += sep + part_len;
+            shown += 1;
+            continue;
+        }
+        if shown == 0 {
+            let keep = budget.saturating_sub(1);
+            let truncated: String = part.chars().take(keep).collect();
+            out.push_str(truncated.trim_end());
+            out.push('…');
+            shown = 1;
+        }
+        break;
+    }
+    if shown < parts.len() {
+        out.push_str(note);
+    }
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect();
     }
     out
 }
@@ -455,6 +502,19 @@ mod tests {
         let inside = vault.join("index.db");
         assert!(require_index_outside_vault(&vault, &inside).is_err());
         assert!(require_index_outside_vault(&vault, &dir.path().join("outside.db")).is_ok());
+    }
+
+    #[test]
+    fn model_text_keeps_only_the_hits_that_fit() {
+        let hit = |n: &str| format!("path: Notes/{n}.md\nscore: 0.500\n{}\n", "x".repeat(1500));
+        let text = format!("{}\n---\n{}\n---\n{}", hit("A"), hit("B"), hit("C"));
+        let limited = limit_model_text(&text, 4000);
+        assert!(limited.chars().count() <= 4000);
+        assert!(limited.contains("Notes/A.md"));
+        assert!(limited.contains("Notes/B.md"));
+        assert!(!limited.contains("Notes/C.md"));
+        assert!(limited.contains("omitted"));
+        assert_eq!(limit_model_text("short", 4000), "short");
     }
 
     #[test]

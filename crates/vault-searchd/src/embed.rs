@@ -13,7 +13,7 @@ impl HttpEmbedder {
     pub fn new(url: &str) -> Result<Self, String> {
         assert_loopback(url)?;
         let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(8))
+            .timeout(std::time::Duration::from_secs(30))
             .build();
         Ok(Self {
             url: url.to_string(),

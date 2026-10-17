@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
-use vault_search::{roundtrip, IpcRequest};
+use vault_search::{limit_model_text, roundtrip, IpcRequest, MODEL_RESULT_CHARS};
 
 const PROTOCOL: &str = "2024-11-05";
 
@@ -22,12 +22,12 @@ pub fn dispatch(line: &str, socket: &Path) -> Result<Option<String>, String> {
         "tools/list" => json!({
             "tools": [{
                 "name": "search",
-                "description": "Search the Obsidian vault by meaning and return the closest notes. The vault root is fixed by the daemon. Do not pass a filesystem path.",
+                "description": "Search the Obsidian vault by meaning and return a few short excerpts. The reply is capped at about 1000 tokens so it cannot fill the chat context. The vault root is fixed by the daemon. Do not pass a filesystem path.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Natural-language question"},
-                        "k": {"type": "integer", "description": "How many notes to return. Default 6, maximum 12."}
+                        "k": {"type": "integer", "description": "How many notes to consider. Default 4, maximum 4. The text cap may return fewer."}
                     },
                     "required": ["query"]
                 }
@@ -70,7 +70,13 @@ fn call_tool(msg: &Value, socket: &Path) -> Result<Value, String> {
             "isError": true
         }));
     }
-    let k = args.get("k").and_then(Value::as_u64).map(|n| n as u32);
+    let k = Some(
+        args.get("k")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+            .unwrap_or(4)
+            .clamp(1, 4),
+    );
     match roundtrip(
         socket,
         &IpcRequest::Search {
@@ -78,10 +84,13 @@ fn call_tool(msg: &Value, socket: &Path) -> Result<Value, String> {
             k,
         },
     ) {
-        Ok(response) if response.ok => Ok(json!({
-            "content": [{"type": "text", "text": response.text.unwrap_or_default()}],
-            "isError": false
-        })),
+        Ok(response) if response.ok => {
+            let text = limit_model_text(&response.text.unwrap_or_default(), MODEL_RESULT_CHARS);
+            Ok(json!({
+                "content": [{"type": "text", "text": text}],
+                "isError": false
+            }))
+        }
         Ok(response) => Ok(json!({
             "content": [{"type": "text", "text": response.error.unwrap_or_else(|| "search failed".into())}],
             "isError": true

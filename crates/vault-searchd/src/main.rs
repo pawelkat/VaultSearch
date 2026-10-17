@@ -274,7 +274,7 @@ fn reindex_inner(app: &App) -> Result<(), String> {
                     .iter()
                     .map(|chunk| document_prefix(&chunk.title, &chunk.text))
                     .collect::<Vec<_>>();
-                let vectors = app.embedder.embed(&inputs, app.dim)?;
+                let vectors = embed_batched(&app.embedder, &inputs, app.dim)?;
                 app.index
                     .upsert(path, *mtime, &chunks, &vectors)
                     .map_err(|e| e.to_string())?;
@@ -283,6 +283,18 @@ fn reindex_inner(app: &App) -> Result<(), String> {
     }
     app.index.delete(&plan.delete).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn embed_batched(
+    embedder: &crate::embed::HttpEmbedder,
+    inputs: &[String],
+    dim: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    let mut vectors = Vec::with_capacity(inputs.len());
+    for batch in inputs.chunks(2) {
+        vectors.extend(embedder.embed(batch, dim)?);
+    }
+    Ok(vectors)
 }
 
 fn load_note(rel: &str, full: &Path) -> Result<Option<Vec<Chunk>>, String> {
