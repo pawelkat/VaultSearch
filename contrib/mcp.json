@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "vault": {
+      "command": "vault-search-mcp",
+      "args": [],
+      "timeout_ms": 10000
+    }
+  }
+}

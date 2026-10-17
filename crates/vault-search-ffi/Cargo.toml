@@ -1,0 +1,19 @@
+[package]
+name = "vault-search-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "UniFFI bindings so Android can call vault-search"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+thiserror = "2"
+uniffi = { version = "0.29", features = ["cli"] }
+vault-search = { path = "../vault-search" }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"

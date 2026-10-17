@@ -1,0 +1,19 @@
+[package]
+name = "vault-search-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Short-lived stdio MCP bridge from llama-server to vault-searchd"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vault-search-mcp"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = "1"
+vault-search = { path = "../vault-search" }
