@@ -16,6 +16,10 @@ pub const DEFAULT_REMOTE: &str = "gdrive:Vault";
 pub const DEFAULT_MAX_DELETE: u32 = 50;
 /// Refuse sync/resync when either side has fewer files than this (PR2).
 pub const DEFAULT_MIN_FILES: u32 = 3;
+/// `--conflict-suffix` for bisync. rclone puts a `.` before it and a number
+/// after it, so a losing `note.md` becomes `note.md..conflict-2026-10-30-1`.
+/// `{DateOnly}` is an rclone date macro (Go's `2006-01-02`).
+pub const DEFAULT_CONFLICT_SUFFIX: &str = ".conflict-{DateOnly}-";
 
 /// Keys this crate reads. Anything else in a config file is ignored and never printed.
 pub const KNOWN_KEYS: &[&str] = &[
@@ -25,6 +29,8 @@ pub const KNOWN_KEYS: &[&str] = &[
     "RCLONE_CONFIG",
     "MAX_DELETE",
     "MIN_FILES",
+    "FILTERS_FILE",
+    "CONFLICT_SUFFIX",
 ];
 
 /// Resolved settings. Holds paths only, never credentials.
@@ -38,6 +44,11 @@ pub struct Config {
     pub rclone_config: Option<PathBuf>,
     pub max_delete: u32,
     pub min_files: u32,
+    /// Explicit `FILTERS_FILE` for `bisync --filters-file`. `None` means use
+    /// `filters.txt` next to a default config file if one exists.
+    pub filters_file: Option<PathBuf>,
+    /// `--conflict-suffix` passed to bisync.
+    pub conflict_suffix: String,
     /// Config files that existed and were read, lowest precedence first.
     pub files_read: Vec<PathBuf>,
 }
@@ -87,6 +98,12 @@ impl Config {
 
         let vault_remote = get("VAULT_REMOTE").unwrap_or(DEFAULT_REMOTE).to_string();
         validate_remote(&vault_remote)?;
+        let conflict_suffix = get("CONFLICT_SUFFIX")
+            .unwrap_or(DEFAULT_CONFLICT_SUFFIX)
+            .to_string();
+        if conflict_suffix.contains('/') || conflict_suffix.contains('\\') {
+            return Err(Error::BadConflictSuffix(conflict_suffix));
+        }
 
         Ok(Config {
             vault_local: path_of("VAULT_LOCAL"),
@@ -95,6 +112,8 @@ impl Config {
             rclone_config: path_of("RCLONE_CONFIG"),
             max_delete: number(get("MAX_DELETE"), "MAX_DELETE", DEFAULT_MAX_DELETE)?,
             min_files: number(get("MIN_FILES"), "MIN_FILES", DEFAULT_MIN_FILES)?,
+            filters_file: path_of("FILTERS_FILE"),
+            conflict_suffix,
             files_read,
         })
     }
@@ -238,6 +257,28 @@ mod tests {
         assert_eq!(c.remote_name(), "gdrive");
         assert!(c.vault_local.is_none());
         assert!(matches!(c.require_local(), Err(Error::MissingLocal)));
+        assert_eq!(c.conflict_suffix, ".conflict-{DateOnly}-");
+        assert!(c.filters_file.is_none());
+    }
+
+    #[test]
+    fn filters_and_conflict_suffix_keys() {
+        let env = |k: &str| match k {
+            "FILTERS_FILE" => Some("~/.config/vault-sync/filters.txt".to_string()),
+            "CONFLICT_SUFFIX" => Some(".conflict-{Date}".to_string()),
+            _ => None,
+        };
+        let c = Config::load_from(env, &[], Some(Path::new("/h"))).unwrap();
+        assert_eq!(
+            c.filters_file.as_deref(),
+            Some(Path::new("/h/.config/vault-sync/filters.txt"))
+        );
+        assert_eq!(c.conflict_suffix, ".conflict-{Date}");
+        let bad = |k: &str| (k == "CONFLICT_SUFFIX").then(|| "a/b".to_string());
+        assert!(matches!(
+            Config::load_from(bad, &[], None),
+            Err(Error::BadConflictSuffix(_))
+        ));
     }
 
     #[test]

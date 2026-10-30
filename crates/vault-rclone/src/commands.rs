@@ -1,7 +1,9 @@
-//! `status`, `check-config`, and the PR2 placeholders.
+//! `status` and `check-config`, plus the shared [`Host`]. `sync`, `resync`,
+//! and `lsf` live in [`crate::sync`].
 //!
 //! Commands write human-readable lines to `out` and return a process exit
-//! code: 0 ok, 1 a check failed, 2 not available yet.
+//! code: 0 ok, 1 a check failed or a guard refused, 2 bad config. `sync`,
+//! `resync`, and `lsf` pass rclone's own non-zero exit code through.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -13,7 +15,8 @@ use crate::rclone::{self, CommandRunner};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAIL: i32 = 1;
-pub const EXIT_NOT_YET: i32 = 2;
+/// Config could not be loaded (bad `config.env`, bad `VAULT_REMOTE`, ...).
+pub const EXIT_CONFIG: i32 = 2;
 
 /// Facts about the machine that commands need, injectable for tests.
 pub struct Host {
@@ -21,6 +24,9 @@ pub struct Host {
     pub path_var: Option<OsString>,
     /// `$XDG_CACHE_HOME`, else `~/.cache`.
     pub cache_dir: Option<PathBuf>,
+    /// `$XDG_STATE_HOME`, else `~/.local/state`. The sync log goes under
+    /// `<state_dir>/vault-rclone/`. `None` disables the log.
+    pub state_dir: Option<PathBuf>,
     pub is_exec: fn(&Path) -> bool,
 }
 
@@ -31,15 +37,20 @@ impl Host {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(".cache")));
+        let state_dir = std::env::var_os("XDG_STATE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".local").join("state")));
         Host {
             home,
             path_var: std::env::var_os("PATH"),
             cache_dir,
+            state_dir,
             is_exec: rclone::is_executable,
         }
     }
 
-    fn locate(&self, cfg: &Config) -> Result<PathBuf, Error> {
+    pub(crate) fn locate(&self, cfg: &Config) -> Result<PathBuf, Error> {
         rclone::locate_rclone(
             cfg.rclone_bin.as_deref(),
             self.path_var.as_deref(),
@@ -320,15 +331,6 @@ pub fn check_config(
     Ok(if ok { EXIT_OK } else { EXIT_FAIL })
 }
 
-/// `sync`, `resync`, `lsf`: reserved until the guarded bisync lands (PR2).
-pub fn not_yet(name: &str, out: &mut dyn Write) -> io::Result<i32> {
-    writeln!(
-        out,
-        "vault-rclone {name}: coming in a later release. Keep using the bash `vault-sync` for now."
-    )?;
-    Ok(EXIT_NOT_YET)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +398,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             path_var: None,
             cache_dir: Some(dir.path().join("cache")),
+            state_dir: Some(dir.path().join("state")),
             is_exec: |_| true,
         };
         let mut cfg = Config::load_from(|_| None, &[], None).unwrap();
@@ -549,14 +552,5 @@ mod tests {
         let (code, s) = run(|o| status(&cfg, &host, &Down, false, o));
         assert_eq!(code, EXIT_FAIL);
         assert!(s.contains("reach:   FAILED: dial tcp: no such host"));
-    }
-
-    #[test]
-    fn deferred_commands_exit_2() {
-        for name in ["sync", "resync", "lsf"] {
-            let (code, s) = run(|o| not_yet(name, o));
-            assert_eq!(code, EXIT_NOT_YET);
-            assert!(s.contains("coming in a later release"));
-        }
     }
 }

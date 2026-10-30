@@ -104,8 +104,9 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 
 ## Vault sync (rclone)
 
-`crates/vault-rclone` wraps the `rclone` binary for `gdrive:Vault` only. It follows the vault note DriveSync Replacement: one vault folder, no whole-Drive sync, no mount, and no tokens in output. This release has `status` and `check-config`. `sync` and `resync` come later, so keep using the bash `vault-sync` for now. See [crates/vault-rclone/README.md](crates/vault-rclone/README.md).
+`crates/vault-rclone` wraps the `rclone` binary for `gdrive:Vault` only. It follows the vault note DriveSync Replacement: one vault folder, no whole-Drive sync, no mount, and no tokens in output. Commands: `status`, `check-config`, `lsf`, and guarded `sync` / `resync` (refuse when either side has fewer than `MIN_FILES` files, always `--max-delete`, newer-wins with `*.conflict-…` losers kept, run log in `~/.local/state/vault-rclone/sync.log`). The bash `vault-sync` stays in production until this has survived real edits; the parity checklist against it is in [crates/vault-rclone/README.md](crates/vault-rclone/README.md).
 
 ```bash
 cargo run -p vault-rclone -- status
+cargo run -p vault-rclone -- sync --dry-run
 ```

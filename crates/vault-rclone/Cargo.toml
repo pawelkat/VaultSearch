@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Vault-only wrapper around the rclone binary: config, status, and auth checks"
+description = "Vault-only wrapper around the rclone binary: guarded bisync, status, and auth checks"
 
 [lib]
 path = "src/lib.rs"

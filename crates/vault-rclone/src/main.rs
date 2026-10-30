@@ -4,8 +4,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use vault_rclone::commands::{self, Host, EXIT_FAIL, EXIT_NOT_YET};
-use vault_rclone::{Config, SystemRunner};
+use vault_rclone::commands::{self, Host, EXIT_CONFIG, EXIT_FAIL};
+use vault_rclone::{sync, Config, SystemRunner};
 
 #[derive(Parser)]
 #[command(
@@ -36,41 +36,50 @@ enum Cmd {
         #[arg(long)]
         offline: bool,
     },
-    /// Incremental bisync with guards. Not available yet.
-    Sync,
-    /// bisync --resync after empty-side checks. Not available yet.
-    Resync,
-    /// List the remote's top level. Not available yet.
-    Lsf,
+    /// Incremental bisync (remote <-> local) after empty-side guards.
+    Sync {
+        /// Pass --dry-run to rclone: show what would change, change nothing.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+    /// bisync --resync --resync-mode newer after the same guards. For the
+    /// first run, after rclone exit 7, or after editing the filters file.
+    Resync {
+        /// Pass --dry-run to rclone. Strongly recommended first.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+    /// List the remote's top level (or VAULT_LOCAL's with --local).
+    Lsf {
+        /// List VAULT_LOCAL instead of the remote.
+        #[arg(long)]
+        local: bool,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let mut out = std::io::stdout().lock();
 
-    let code = match cli.cmd {
-        Cmd::Sync => commands::not_yet("sync", &mut out),
-        Cmd::Resync => commands::not_yet("resync", &mut out),
-        Cmd::Lsf => commands::not_yet("lsf", &mut out),
-        Cmd::Status { offline } | Cmd::CheckConfig { offline } => {
-            let cfg = match Config::load(cli.config.as_deref()) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("vault-rclone: {e}");
-                    return ExitCode::from(EXIT_NOT_YET as u8);
-                }
-            };
-            let host = Host::from_process();
-            if matches!(cli.cmd, Cmd::Status { .. }) {
-                commands::status(&cfg, &host, &SystemRunner, offline, &mut out)
-            } else {
-                commands::check_config(&cfg, &host, &SystemRunner, offline, &mut out)
-            }
+    let cfg = match Config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("vault-rclone: {e}");
+            return ExitCode::from(EXIT_CONFIG as u8);
         }
+    };
+    let host = Host::from_process();
+    let r = &SystemRunner;
+    let code = match cli.cmd {
+        Cmd::Status { offline } => commands::status(&cfg, &host, r, offline, &mut out),
+        Cmd::CheckConfig { offline } => commands::check_config(&cfg, &host, r, offline, &mut out),
+        Cmd::Sync { dry_run } => sync::sync(&cfg, &host, r, dry_run, &mut out),
+        Cmd::Resync { dry_run } => sync::resync(&cfg, &host, r, dry_run, &mut out),
+        Cmd::Lsf { local } => sync::lsf(&cfg, &host, r, local, &mut out),
     };
     let _ = out.flush();
     match code {
-        Ok(c) => ExitCode::from(c as u8),
+        Ok(c) => ExitCode::from(u8::try_from(c).unwrap_or(EXIT_FAIL as u8)),
         Err(e) => {
             eprintln!("vault-rclone: cannot write output: {e}");
             ExitCode::from(EXIT_FAIL as u8)

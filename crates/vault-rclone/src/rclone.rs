@@ -154,6 +154,117 @@ pub fn size_args(cfg: &Config) -> Vec<String> {
     with_globals(cfg, &["size", "--json", "--fast-list", &cfg.vault_remote])
 }
 
+/// `rclone lsf --max-depth 1 [--fast-list] <target>` — top-level listing for
+/// smoke checks. `target` is the vault remote by default, or the local path.
+/// `--fast-list` only helps (and is only passed) for the remote.
+pub fn lsf_args(cfg: &Config, local: Option<&Path>) -> Vec<String> {
+    let mut v = with_globals(cfg, &["lsf", "--max-depth", "1"]);
+    match local {
+        Some(p) => v.push(p.display().to_string()),
+        None => {
+            v.push("--fast-list".into());
+            v.push(cfg.vault_remote.clone());
+        }
+    }
+    v
+}
+
+/// Options for one bisync run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BisyncOpts<'a> {
+    /// First run, or recovery after a critical error / filters change.
+    pub resync: bool,
+    /// Pass `--dry-run`.
+    pub dry_run: bool,
+    /// Pass `--filters-file`.
+    pub filters_file: Option<&'a Path>,
+}
+
+/// `rclone bisync <VAULT_REMOTE> <VAULT_LOCAL> ...`
+///
+/// Path1 is the remote and Path2 the local folder, the same order as the
+/// Nitro setup, so bisync's listing files in `~/.cache/rclone/bisync` keep
+/// their names if the bash script and this binary take turns.
+///
+/// Always passes `--max-delete`, newer-wins conflict resolution with a
+/// `*.conflict-…` loser kept, `--fast-list`, and `-v` so the run summary
+/// lands on stderr. `--resync` adds `--resync-mode newer`, so a resync also
+/// keeps the newer copy instead of rclone's default "Path1 always wins".
+pub fn bisync_args(cfg: &Config, local: &Path, opts: &BisyncOpts<'_>) -> Vec<String> {
+    let max_delete = cfg.max_delete.to_string();
+    let mut v = with_globals(
+        cfg,
+        &[
+            "bisync",
+            &cfg.vault_remote,
+            &local.display().to_string(),
+            "--max-delete",
+            &max_delete,
+            "--conflict-resolve",
+            "newer",
+            "--conflict-loser",
+            "num",
+            "--conflict-suffix",
+            &cfg.conflict_suffix,
+            "--fast-list",
+            "-v",
+        ],
+    );
+    if let Some(f) = opts.filters_file {
+        v.push("--filters-file".into());
+        v.push(f.display().to_string());
+    }
+    if opts.resync {
+        v.extend(["--resync", "--resync-mode", "newer"].map(String::from));
+    }
+    if opts.dry_run {
+        v.push("--dry-run".into());
+    }
+    v
+}
+
+/// High-level lines from a verbose bisync log: change counts, conflicts, and
+/// the final verdict. Per-file lines are dropped so the log stays short and
+/// note names do not pile up outside the vault.
+pub fn bisync_summary(stderr: &str) -> Vec<String> {
+    const KEEP: &[&str] = &[
+        "Path1:",
+        "Path2:",
+        "No changes found",
+        "Bisync successful",
+        "Bisync critical error",
+        "Bisync aborted",
+        "Must run --resync",
+        "too many deletes",
+        "Safety abort",
+        "Empty current Path",
+        "lock file found",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let mut conflicts = 0usize;
+    for line in stderr.lines() {
+        let l = line.trim();
+        if l.contains("New or changed in both paths") {
+            conflicts += 1;
+            continue;
+        }
+        if KEEP.iter().any(|k| l.contains(k)) {
+            // Drop rclone's `2026/10/30 13:05:00 INFO  : ` prefix.
+            let msg = l.split_once(" : ").map_or(l, |(_, m)| m).trim();
+            let msg = safe_summary(msg);
+            if !out.contains(&msg) {
+                out.push(msg);
+            }
+        }
+    }
+    if conflicts > 0 {
+        out.push(format!(
+            "{conflicts} conflict(s): newer kept, loser renamed"
+        ));
+    }
+    out
+}
+
 /// First line of `rclone version`, e.g. `rclone v1.75.0`.
 pub fn parse_version(stdout: &str) -> Option<String> {
     stdout
@@ -359,9 +470,96 @@ mod tests {
     }
 
     #[test]
+    fn lsf_argv() {
+        let c = cfg();
+        assert_eq!(
+            lsf_args(&c, None),
+            ["lsf", "--max-depth", "1", "--fast-list", "gdrive:Vault"]
+        );
+        assert_eq!(
+            lsf_args(&c, Some(Path::new("/v"))),
+            ["lsf", "--max-depth", "1", "/v"]
+        );
+    }
+
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn bisync_argv_sync_and_resync() {
+        let mut c = cfg();
+        c.max_delete = 25;
+        let local = Path::new("/home/u/Vault");
+        let sync = bisync_args(&c, local, &BisyncOpts::default());
+        assert_eq!(&sync[..3], ["bisync", "gdrive:Vault", "/home/u/Vault"]);
+        assert_eq!(flag_value(&sync, "--max-delete"), Some("25"));
+        assert_eq!(flag_value(&sync, "--conflict-resolve"), Some("newer"));
+        assert_eq!(flag_value(&sync, "--conflict-loser"), Some("num"));
+        assert_eq!(
+            flag_value(&sync, "--conflict-suffix"),
+            Some(".conflict-{DateOnly}-")
+        );
+        assert!(sync.contains(&"--fast-list".to_string()));
+        assert!(!sync.contains(&"--resync".to_string()));
+        assert!(!sync.contains(&"--resync-mode".to_string()));
+        assert!(!sync.contains(&"--dry-run".to_string()));
+        assert!(!sync.contains(&"--filters-file".to_string()));
+
+        let f = Path::new("/h/filters.txt");
+        let re = bisync_args(
+            &c,
+            local,
+            &BisyncOpts {
+                resync: true,
+                dry_run: true,
+                filters_file: Some(f),
+            },
+        );
+        assert!(re.contains(&"--resync".to_string()));
+        assert_eq!(flag_value(&re, "--resync-mode"), Some("newer"));
+        assert_eq!(flag_value(&re, "--filters-file"), Some("/h/filters.txt"));
+        assert_eq!(flag_value(&re, "--max-delete"), Some("25"));
+        assert!(re.contains(&"--dry-run".to_string()));
+
+        c.rclone_config = Some(PathBuf::from("/h/rclone.conf"));
+        let g = bisync_args(&c, local, &BisyncOpts::default());
+        assert_eq!(&g[..3], ["--config", "/h/rclone.conf", "bisync"]);
+    }
+
+    #[test]
+    fn bisync_summary_keeps_totals_only() {
+        let log = "\
+2026/10/30 13:05:00 INFO  : Synching Path1 \"gdrive:Vault/\" with Path2 \"/v/\"
+2026/10/30 13:05:01 INFO  : - Path1    File is newer                       - Daily/secret-plans.md
+2026/10/30 13:05:01 INFO  : Path1:    1 changes:    0 new,    1 newer,    0 older,    0 deleted
+2026/10/30 13:05:01 INFO  : Path2:    1 changes:    0 new,    1 newer,    0 older,    0 deleted
+2026/10/30 13:05:01 NOTICE: - WARNING  New or changed in both paths        - Daily/secret-plans.md
+2026/10/30 13:05:02 INFO  : Bisync successful
+";
+        let s = bisync_summary(log);
+        assert_eq!(
+            s,
+            [
+                "Path1:    1 changes:    0 new,    1 newer,    0 older,    0 deleted",
+                "Path2:    1 changes:    0 new,    1 newer,    0 older,    0 deleted",
+                "Bisync successful",
+                "1 conflict(s): newer kept, loser renamed",
+            ]
+        );
+        assert!(!s.join("\n").contains("secret-plans"));
+        let s = bisync_summary("ERROR : Bisync critical error: oauth2: refresh_token invalid\n");
+        assert_eq!(s.len(), 1);
+        assert!(!s[0].contains("refresh_token"), "{s:?}");
+    }
+
+    #[test]
     fn argv_never_targets_drive_root() {
         let c = cfg();
-        for argv in [lsd_args(&c), size_args(&c)] {
+        for argv in [lsd_args(&c), size_args(&c), lsf_args(&c, None)] {
             let target = argv.last().unwrap();
             assert_eq!(target, "gdrive:Vault");
             assert!(!target.ends_with(':'));

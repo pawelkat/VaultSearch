@@ -15,6 +15,10 @@ pub enum Error {
     BadRemote(String),
     #[error("VAULT_REMOTE {0:?} points at the remote root; only a vault folder is allowed")]
     WholeRemote(String),
+    #[error("CONFLICT_SUFFIX must not contain a path separator, got {0:?}")]
+    BadConflictSuffix(String),
+    #[error("FILTERS_FILE {0} does not exist")]
+    MissingFilters(PathBuf),
     #[error("VAULT_LOCAL is not set (env or ~/.config/vault-sync/config.env)")]
     MissingLocal,
     #[error("rclone not found; tried: {}", tried.join(", "))]

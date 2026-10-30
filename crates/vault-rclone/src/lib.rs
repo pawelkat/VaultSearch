@@ -5,14 +5,19 @@
 //! answers. Sync policy follows the vault note "DriveSync Replacement":
 //! only `gdrive:Vault` against one local folder, never the whole Drive.
 //!
-//! PR1 ships config loading, `status`, and `check-config`. `sync`, `resync`,
-//! and `lsf` are reserved and refuse with exit code 2 until PR2.
+//! Commands: `status`, `check-config`, `lsf`, and the guarded `sync` /
+//! `resync` (empty-side refuse, `--max-delete`, newer-wins conflicts, run
+//! log). The bash `vault-sync` stays in production until this has survived
+//! real edits.
 
 pub mod commands;
 pub mod config;
 pub mod error;
 pub mod rclone;
+pub mod sync;
 
-pub use config::{Config, DEFAULT_MAX_DELETE, DEFAULT_MIN_FILES, DEFAULT_REMOTE};
+pub use config::{
+    Config, DEFAULT_CONFLICT_SUFFIX, DEFAULT_MAX_DELETE, DEFAULT_MIN_FILES, DEFAULT_REMOTE,
+};
 pub use error::Error;
-pub use rclone::{CommandRunner, RunOutput, SystemRunner};
+pub use rclone::{BisyncOpts, CommandRunner, RunOutput, SystemRunner};
