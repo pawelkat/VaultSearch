@@ -1,4 +1,6 @@
 mod embed;
+mod status;
+mod sync;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -12,10 +14,12 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
+use vault_rclone::reindex::ReindexReply;
+use vault_rclone::SystemRunner;
 use vault_search::{
     chunk_markdown, document_prefix, format_hits, indexable_bytes, indexable_path, query_prefix,
     require_index_outside_vault, roundtrip, roundtrip_with_timeout, Chunk, Hit, Index, IpcHit,
-    IpcRequest, IpcResponse, Stamp, MAX_FILE_BYTES,
+    IpcRequest, IpcResponse, IpcSyncStatus, Stamp, MAX_FILE_BYTES,
 };
 
 use crate::embed::HttpEmbedder;
@@ -36,6 +40,8 @@ enum Cmd {
     /// Ask a running daemon for an incremental reindex (changed mtimes only)
     /// and wait for it to finish.
     Reindex(ReindexArgs),
+    /// Print a running daemon's index, embedder, and sync health.
+    Status(StatusArgs),
 }
 
 #[derive(clap::Args)]
@@ -54,6 +60,27 @@ struct ServeArgs {
     /// Defaults to $XDG_RUNTIME_DIR/vault-search.sock, else /tmp/vault-search-$UID.sock.
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Run the guarded vault-rclone bisync every N seconds, then an
+    /// incremental reindex. 0 (default) leaves sync to someone else.
+    #[arg(long, default_value_t = 0, value_name = "SECS")]
+    sync_interval: u64,
+    /// Force sync off even if --sync-interval is set.
+    #[arg(long)]
+    no_sync: bool,
+    /// vault-rclone config.env to read instead of ~/.config/vault-sync/config.env
+    /// and ~/.config/vault-rclone/config.env. Environment still wins.
+    /// VAULT_LOCAL is always replaced by --vault.
+    #[arg(long, value_name = "FILE")]
+    sync_config: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct StatusArgs {
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    /// Print the raw JSON reply instead of the human summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
@@ -80,6 +107,7 @@ fn main() {
         Cmd::Serve(args) => serve(args),
         Cmd::Query(args) => query(args),
         Cmd::Reindex(args) => reindex_client(args),
+        Cmd::Status(args) => status_client(args),
     };
     if let Err(err) = result {
         eprintln!("vault-searchd: {err}");
@@ -122,6 +150,20 @@ fn reindex_client(args: ReindexArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn status_client(args: StatusArgs) -> Result<(), String> {
+    let socket = args.socket.unwrap_or_else(default_socket);
+    let response = roundtrip(&socket, &IpcRequest::Status)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", status::render(&socket, &response));
+    }
+    Ok(())
+}
+
 struct App {
     vault: PathBuf,
     dim: usize,
@@ -129,6 +171,7 @@ struct App {
     embedder: HttpEmbedder,
     indexing: AtomicBool,
     last_error: Mutex<Option<String>>,
+    sync: Arc<Mutex<IpcSyncStatus>>,
 }
 
 fn serve(args: ServeArgs) -> Result<(), String> {
@@ -139,6 +182,12 @@ fn serve(args: ServeArgs) -> Result<(), String> {
     require_index_outside_vault(&vault, &args.index).map_err(|e| e.to_string())?;
     let index = Index::open(&args.index, args.dim).map_err(|e| e.to_string())?;
     let embedder = HttpEmbedder::new(&args.embed_url)?;
+    let sync_job = sync::job_from_flags(
+        args.sync_interval,
+        args.no_sync,
+        args.sync_config.as_deref(),
+        &vault,
+    )?;
     let socket = args.socket.unwrap_or_else(default_socket);
     if let Some(parent) = socket.parent() {
         if !parent.as_os_str().is_empty() {
@@ -157,6 +206,7 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         embedder,
         indexing: AtomicBool::new(false),
         last_error: Mutex::new(None),
+        sync: Arc::new(Mutex::new(sync::initial_status(sync_job.as_ref()))),
     });
     let scanner = Arc::clone(&app);
     std::thread::spawn(move || loop {
@@ -166,6 +216,21 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_secs(60));
     });
+    match sync_job {
+        None => eprintln!("vault-searchd: sync off (--sync-interval 0)"),
+        Some(job) => {
+            eprintln!("vault-searchd: {}", sync::describe(&job));
+            let reindexer = Arc::clone(&app);
+            let reindex: Arc<sync::ReindexFn> = Arc::new(move || sync_reindex(&reindexer));
+            sync::spawn_loop(
+                job,
+                SystemRunner,
+                reindex,
+                Arc::clone(&app.sync),
+                Arc::new(AtomicBool::new(false)),
+            );
+        }
+    }
     eprintln!(
         "vault-searchd listening on {} (dim {})",
         socket.display(),
@@ -205,12 +270,9 @@ fn handle_conn(app: &App, stream: UnixStream) -> Result<(), String> {
         Err(err) => IpcResponse {
             ok: false,
             error: Some(err),
-            text: None,
-            hits: None,
-            notes: None,
-            chunks: None,
             indexing: Some(app.indexing.load(Ordering::Relaxed)),
             dim: Some(app.dim as u32),
+            ..Default::default()
         },
     };
     let mut line = serde_json::to_string(&response).map_err(|e| e.to_string())?;
@@ -247,37 +309,61 @@ fn hits_response(app: &App, hits: Vec<Hit>) -> IpcResponse {
         chunks: app.index.chunk_count().ok(),
         indexing: Some(app.indexing.load(Ordering::Relaxed)),
         dim: Some(app.dim as u32),
+        ..Default::default()
     }
 }
 
+/// Index counts plus (status only) vault, embedder reachability, and sync
+/// health. `ok` reflects the index only; sync failures live in `sync`.
 fn status(app: &App) -> IpcResponse {
     let err = app.last_error.lock().ok().and_then(|e| e.clone());
     IpcResponse {
         ok: err.is_none(),
         error: err,
-        text: None,
-        hits: None,
         notes: app.index.note_count().ok(),
         chunks: app.index.chunk_count().ok(),
         indexing: Some(app.indexing.load(Ordering::Relaxed)),
         dim: Some(app.dim as u32),
+        vault: Some(app.vault.display().to_string()),
+        embed_ok: Some(app.embedder.reachable(Duration::from_millis(500))),
+        embed_url: Some(app.embedder.url().to_string()),
+        sync: app.sync.lock().ok().map(|s| s.clone()),
+        ..Default::default()
     }
 }
 
-fn reindex(app: &App) -> Result<(), String> {
+/// In-process reindex for the sync loop, shaped like the socket reply
+/// vault-rclone expects. `indexing: true` = another reindex was running.
+fn sync_reindex(app: &App) -> Result<ReindexReply, String> {
+    let ran = reindex(app).inspect_err(|err| {
+        if let Ok(mut last) = app.last_error.lock() {
+            *last = Some(err.clone());
+        }
+    })?;
+    Ok(ReindexReply {
+        ok: true,
+        error: None,
+        notes: app.index.note_count().ok(),
+        chunks: app.index.chunk_count().ok(),
+        indexing: Some(!ran),
+    })
+}
+
+/// Incremental reindex. `Ok(false)` when another one was already running.
+fn reindex(app: &App) -> Result<bool, String> {
     if app
         .indexing
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return Ok(());
+        return Ok(false);
     }
     let result = reindex_inner(app);
     app.indexing.store(false, Ordering::Release);
     if result.is_ok() {
         *app.last_error.lock().map_err(|e| e.to_string())? = None;
     }
-    result
+    result.map(|()| true)
 }
 
 fn reindex_inner(app: &App) -> Result<(), String> {

@@ -16,3 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2.12", features = ["json"] }
 vault-search = { path = "../vault-search" }
+vault-rclone = { path = "../vault-rclone" }
+
+[dev-dependencies]
+tempfile = "3"

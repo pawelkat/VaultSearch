@@ -21,6 +21,31 @@ impl HttpEmbedder {
         })
     }
 
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Cheap liveness probe for `status`: can we open a TCP connection to the
+    /// embedder's host:port? Does not send an embedding request.
+    pub fn reachable(&self, timeout: std::time::Duration) -> bool {
+        use std::net::{TcpStream, ToSocketAddrs};
+        let Some(rest) = self.url.strip_prefix("http://") else {
+            return false;
+        };
+        let authority = rest.split('/').next().unwrap_or("");
+        let addr = if authority.contains(':') {
+            authority.to_string()
+        } else {
+            format!("{authority}:80")
+        };
+        let Ok(addrs) = addr.to_socket_addrs() else {
+            return false;
+        };
+        addrs
+            .into_iter()
+            .any(|a| TcpStream::connect_timeout(&a, timeout).is_ok())
+    }
+
     pub fn embed(&self, texts: &[String], dim: usize) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());

@@ -1,0 +1,19 @@
+# EmbeddingGemma loopback embedder for vault-searchd (127.0.0.1:8081).
+# Not installed or enabled by the build or CI. To use:
+#   install -Dm644 contrib/embed_server.py ~/.local/share/vault-search/embed_server.py
+#   cp contrib/vault-embed.service contrib/vault-searchd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vault-embed.service vault-searchd.service
+# The first start downloads the model; give it a few minutes.
+[Unit]
+Description=Vault search embedder (EmbeddingGemma, loopback only)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/vault-search/embed_server.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

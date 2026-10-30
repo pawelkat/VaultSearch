@@ -99,7 +99,7 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 |---|---|
 | `vault-search` | Library. No model, no MCP, no file watcher. |
 | `vault-search-ffi` | UniFFI `cdylib`. |
-| `vault-searchd` | Daemon and `query` client. |
+| `vault-searchd` | Daemon (index, search, optional vault sync) and `query` / `reindex` / `status` clients. |
 | `vault-search-mcp` | Line-delimited JSON-RPC, protocol `2024-11-05`. |
 | `vault-rclone` | Vault-only wrapper around the `rclone` binary. |
 
@@ -111,3 +111,47 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 cargo run -p vault-rclone -- status
 cargo run -p vault-rclone -- sync --dry-run
 ```
+
+## Integrated desktop
+
+One product on the desktop: `vault-searchd serve` can own the vault sync as well as the index and search. The embedder stays a separate loopback process (torch weights never enter the Rust binary).
+
+```text
+contrib/embed_server.py (127.0.0.1:8081)
+        ^
+        |  HTTP, loopback only
+vault-searchd serve --sync-interval 120
+        |-- every 120 s: vault-rclone guarded bisync  (gdrive:Vault <-> --vault)
+        |                then, only if it exited 0: incremental reindex in-process
+        |-- every 60 s:  mtime scan + incremental reindex (as before)
+        `-- unix socket: search / reindex / status
+```
+
+1. Start the embedder: `python3 contrib/embed_server.py` (or `contrib/vault-embed.service`).
+2. Start the daemon with sync on:
+
+   ```bash
+   vault-searchd serve \
+     --vault "$HOME/Obsidian/Vault" \
+     --index "$HOME/.local/share/vault-search/index.db" \
+     --embed-url http://127.0.0.1:8081/v1/embeddings \
+     --dim 768 \
+     --sync-interval 120
+   ```
+
+3. Check it: `vault-searchd status` (or `--json`).
+
+How it behaves:
+
+- `--sync-interval 0` (the default) or `--no-sync` leaves sync off; the daemon then behaves exactly as before.
+- Sync calls the `vault-rclone` library, not a copy of it: same guards (`MIN_FILES` empty-side refuse, `--max-delete`, newer-wins with conflict suffix, vault-only remote) and the same run log in `~/.local/state/vault-rclone/sync.log`. Config comes from `~/.config/vault-rclone/config.env` and the environment like the CLI, or from `--sync-config FILE`. `VAULT_LOCAL` is always replaced by `--vault`, so there is one vault root; a different `VAULT_LOCAL` is logged as a warning.
+- The sync runs on its own thread; the socket keeps answering while bisync or the reindex runs. The first sync starts at once, the next one `N` seconds after the previous one finished.
+- A failed sync (guard refusal, rclone non-zero, rclone missing) is logged and shown in `status`; serve keeps running, that cycle skips the reindex, and the next cycle tries again.
+- After a successful sync the daemon reindexes in-process (no socket hop to itself). A failed reindex, e.g. the embedder is down, is reported as `after sync: reindex: FAILED (...)` but the sync still counts as ok: the files are synced. `VAULT_REINDEX=0` turns the post-sync reindex off; the 60 s scan still picks changes up.
+- The index stays outside the vault; serve refuses an index path inside it, so bisync cannot upload it.
+- Run one sync owner per machine. Stop the bash `vault-sync` timer (or any `vault-rclone sync` cron) before turning `--sync-interval` on.
+- The `vault-rclone` CLI stays for sync-only hosts and debugging (`vault-rclone status`, `sync --dry-run`, `resync`).
+
+`vault-searchd status` prints the socket, vault, index counts (`notes`, `chunks`, `dim`, indexing now), the last index error, whether the embedder accepts connections, and the sync health: enabled and interval, remote and local, runs and failures, last sync time (UTC) and exit code, last ok sync, last sync error, and the reindex result after the last good sync. The same fields are in the `{"op":"status"}` reply as optional JSON fields (`vault`, `embed_ok`, `embed_url`, `sync{…}`), so older clients keep working and older daemons simply omit them.
+
+User systemd units (not installed or enabled by the build): `contrib/vault-embed.service` and `contrib/vault-searchd.service`; the latter has the `--sync-interval 120` line commented out.

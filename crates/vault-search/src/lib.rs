@@ -19,5 +19,5 @@ pub use index::{
     clamp_k, fit_dim, format_hits, is_inside, limit_model_text, require_index_outside_vault, Hit,
     Index, Plan, Stamp, MODEL_RESULT_CHARS,
 };
-pub use ipc::{roundtrip, roundtrip_with_timeout, IpcHit, IpcRequest, IpcResponse};
+pub use ipc::{roundtrip, roundtrip_with_timeout, IpcHit, IpcRequest, IpcResponse, IpcSyncStatus};
 pub use prefix::{document_prefix, query_prefix};

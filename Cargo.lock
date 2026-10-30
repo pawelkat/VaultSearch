@@ -1185,7 +1185,9 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "tempfile",
  "ureq",
+ "vault-rclone",
  "vault-search",
 ]
 

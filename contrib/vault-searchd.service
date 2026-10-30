@@ -1,11 +1,23 @@
+# Vault search daemon: index + search, and optionally the guarded vault sync.
+# Start the embedder first (contrib/vault-embed.service). vault-searchd does
+# not fail when the embedder is down; it logs, keeps serving, and retries the
+# reindex on its 60 s scan, so Wants= (not Requires=) is enough.
+# Not installed or enabled by the build or CI.
 [Unit]
-Description=Vault search index
-After=default.target
+Description=Vault search index (and optional vault sync)
+Wants=vault-embed.service
+After=default.target vault-embed.service
 
 [Service]
 Type=simple
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Search only (sync handled elsewhere, e.g. the bash vault-sync on Nitro):
 ExecStart=%h/.local/bin/vault-searchd serve --vault %h/Obsidian/Vault --index %h/.local/share/vault-search/index.db --embed-url http://127.0.0.1:8081/v1/embeddings --dim 768
+# Integrated desktop: also run the guarded vault-rclone bisync every 120 s,
+# then an incremental reindex. Reads ~/.config/vault-rclone/config.env (or
+# --sync-config FILE); VAULT_LOCAL is replaced by --vault. Only one sync
+# owner per machine: stop the bash vault-sync timer before switching.
+#ExecStart=%h/.local/bin/vault-searchd serve --vault %h/Obsidian/Vault --index %h/.local/share/vault-search/index.db --embed-url http://127.0.0.1:8081/v1/embeddings --dim 768 --sync-interval 120
 Restart=on-failure
 RestartSec=5
 
