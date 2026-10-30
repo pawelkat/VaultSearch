@@ -65,6 +65,7 @@ Ask the daemon without a model in the middle:
 
 ```bash
 vault-searchd query "what is still open today"
+vault-searchd reindex          # incremental (changed mtimes only); waits up to 30 min
 ```
 
 llama-server spawns MCP for one call and then stops it, so the model stays in the daemon. Name the server `vault` and the tool `search`. llama-server shows that pair as `vault_search`.
@@ -104,7 +105,7 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 
 ## Vault sync (rclone)
 
-`crates/vault-rclone` wraps the `rclone` binary for `gdrive:Vault` only. It follows the vault note DriveSync Replacement: one vault folder, no whole-Drive sync, no mount, and no tokens in output. Commands: `status`, `check-config`, `lsf`, and guarded `sync` / `resync` (refuse when either side has fewer than `MIN_FILES` files, always `--max-delete`, newer-wins with `*.conflict-…` losers kept, run log in `~/.local/state/vault-rclone/sync.log`). The bash `vault-sync` stays in production until this has survived real edits; the parity checklist against it is in [crates/vault-rclone/README.md](crates/vault-rclone/README.md).
+`crates/vault-rclone` wraps the `rclone` binary for `gdrive:Vault` only. It follows the vault note DriveSync Replacement: one vault folder, no whole-Drive sync, no mount, and no tokens in output. Commands: `status`, `check-config`, `lsf`, and guarded `sync` / `resync` (refuse when either side has fewer than `MIN_FILES` files, always `--max-delete`, newer-wins with `*.conflict-…` losers kept, run log in `~/.local/state/vault-rclone/sync.log`). After a successful, non-dry-run `sync` or `resync` it asks a running `vault-searchd` for an incremental reindex over the Unix socket (`{"op":"reindex"}`); if the daemon is not running or the reindex fails, that is logged and the sync still exits 0. The bash `vault-sync` stays in production until this has survived real edits; the parity checklist against it is in [crates/vault-rclone/README.md](crates/vault-rclone/README.md).
 
 ```bash
 cargo run -p vault-rclone -- status

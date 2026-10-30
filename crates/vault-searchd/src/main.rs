@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand};
 
 use vault_search::{
     chunk_markdown, document_prefix, format_hits, indexable_bytes, indexable_path, query_prefix,
-    require_index_outside_vault, roundtrip, Chunk, Hit, Index, IpcHit, IpcRequest, IpcResponse,
-    Stamp, MAX_FILE_BYTES,
+    require_index_outside_vault, roundtrip, roundtrip_with_timeout, Chunk, Hit, Index, IpcHit,
+    IpcRequest, IpcResponse, Stamp, MAX_FILE_BYTES,
 };
 
 use crate::embed::HttpEmbedder;
@@ -33,6 +33,9 @@ enum Cmd {
     Serve(ServeArgs),
     /// Ask a running daemon one question and print the hits.
     Query(QueryArgs),
+    /// Ask a running daemon for an incremental reindex (changed mtimes only)
+    /// and wait for it to finish.
+    Reindex(ReindexArgs),
 }
 
 #[derive(clap::Args)]
@@ -62,11 +65,21 @@ struct QueryArgs {
     socket: Option<PathBuf>,
 }
 
+#[derive(clap::Args)]
+struct ReindexArgs {
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    /// How long to wait for the daemon to finish embedding.
+    #[arg(long, default_value_t = 1800)]
+    timeout_secs: u64,
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.cmd {
         Cmd::Serve(args) => serve(args),
         Cmd::Query(args) => query(args),
+        Cmd::Reindex(args) => reindex_client(args),
     };
     if let Err(err) = result {
         eprintln!("vault-searchd: {err}");
@@ -87,6 +100,25 @@ fn query(args: QueryArgs) -> Result<(), String> {
         return Err(response.error.unwrap_or_else(|| "search failed".into()));
     }
     println!("{}", response.text.unwrap_or_default());
+    Ok(())
+}
+
+fn reindex_client(args: ReindexArgs) -> Result<(), String> {
+    let socket = args.socket.unwrap_or_else(default_socket);
+    let response = roundtrip_with_timeout(
+        &socket,
+        &IpcRequest::Reindex,
+        Duration::from_secs(args.timeout_secs),
+    )?;
+    if !response.ok {
+        return Err(response.error.unwrap_or_else(|| "reindex failed".into()));
+    }
+    let n = |v: Option<u64>| v.map_or("?".to_string(), |v| v.to_string());
+    println!(
+        "reindex: ok (notes={} chunks={})",
+        n(response.notes),
+        n(response.chunks)
+    );
     Ok(())
 }
 

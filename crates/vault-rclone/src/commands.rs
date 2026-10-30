@@ -28,6 +28,22 @@ pub struct Host {
     /// `<state_dir>/vault-rclone/`. `None` disables the log.
     pub state_dir: Option<PathBuf>,
     pub is_exec: fn(&Path) -> bool,
+    /// `$XDG_RUNTIME_DIR`, for the default `vault-searchd` socket.
+    pub runtime_dir: Option<PathBuf>,
+    /// Real uid, for the `/tmp/vault-search-$UID.sock` fallback.
+    pub uid: u32,
+}
+
+/// Owner uid of `/proc/self`, as `vault-searchd` computes it; 0 if unknown.
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").map_or(0, |m| m.uid())
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
 }
 
 impl Host {
@@ -47,6 +63,10 @@ impl Host {
             cache_dir,
             state_dir,
             is_exec: rclone::is_executable,
+            runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            uid: current_uid(),
         }
     }
 
@@ -400,6 +420,8 @@ mod tests {
             cache_dir: Some(dir.path().join("cache")),
             state_dir: Some(dir.path().join("state")),
             is_exec: |_| true,
+            runtime_dir: None,
+            uid: 0,
         };
         let mut cfg = Config::load_from(|_| None, &[], None).unwrap();
         cfg.vault_local = Some(vault);

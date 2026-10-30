@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use vault_rclone::commands::{self, Host, EXIT_CONFIG, EXIT_FAIL};
-use vault_rclone::{sync, Config, SystemRunner};
+use vault_rclone::{sync, Config, SocketReindexer, SystemRunner};
 
 #[derive(Parser)]
 #[command(
@@ -36,7 +36,8 @@ enum Cmd {
         #[arg(long)]
         offline: bool,
     },
-    /// Incremental bisync (remote <-> local) after empty-side guards.
+    /// Incremental bisync (remote <-> local) after empty-side guards, then
+    /// ask a running vault-searchd for an incremental reindex.
     Sync {
         /// Pass --dry-run to rclone: show what would change, change nothing.
         #[arg(long, short = 'n')]
@@ -73,8 +74,10 @@ fn main() -> ExitCode {
     let code = match cli.cmd {
         Cmd::Status { offline } => commands::status(&cfg, &host, r, offline, &mut out),
         Cmd::CheckConfig { offline } => commands::check_config(&cfg, &host, r, offline, &mut out),
-        Cmd::Sync { dry_run } => sync::sync(&cfg, &host, r, dry_run, &mut out),
-        Cmd::Resync { dry_run } => sync::resync(&cfg, &host, r, dry_run, &mut out),
+        Cmd::Sync { dry_run } => sync::sync(&cfg, &host, r, &SocketReindexer, dry_run, &mut out),
+        Cmd::Resync { dry_run } => {
+            sync::resync(&cfg, &host, r, &SocketReindexer, dry_run, &mut out)
+        }
         Cmd::Lsf { local } => sync::lsf(&cfg, &host, r, local, &mut out),
     };
     let _ = out.flush();

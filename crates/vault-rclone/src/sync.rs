@@ -9,6 +9,11 @@
 //!    syncing against it (above all with `--resync`) can wipe the other side.
 //! 3. `--max-delete` is always passed.
 //!
+//! After bisync exits 0 (and not on `--dry-run`), a running `vault-searchd`
+//! is asked for an incremental reindex over its Unix socket. A missing
+//! daemon, a timeout, or a failed reindex is reported but never changes the
+//! exit code: the files are already synced.
+//!
 //! Each run appends start, guard results, a short summary, and the exit code
 //! to `<state>/vault-rclone/sync.log`. No tokens, no rclone.conf contents,
 //! and no per-file lines go into that log.
@@ -21,6 +26,7 @@ use crate::commands::{count_local_files, Host, EXIT_FAIL, EXIT_OK};
 use crate::config::Config;
 use crate::error::Error;
 use crate::rclone::{self, BisyncOpts, CommandRunner, RunOutput};
+use crate::reindex::{self, Reindexer};
 
 /// `<state_dir>/vault-rclone/sync.log`
 pub fn log_path(host: &Host) -> Option<PathBuf> {
@@ -190,10 +196,11 @@ pub fn sync(
     cfg: &Config,
     host: &Host,
     runner: &dyn CommandRunner,
+    reindexer: &dyn Reindexer,
     dry_run: bool,
     out: &mut dyn Write,
 ) -> io::Result<i32> {
-    run_bisync(cfg, host, runner, false, dry_run, out)
+    run_bisync(cfg, host, runner, reindexer, false, dry_run, out)
 }
 
 /// `vault-rclone resync`: `bisync --resync --resync-mode newer` after the
@@ -203,16 +210,18 @@ pub fn resync(
     cfg: &Config,
     host: &Host,
     runner: &dyn CommandRunner,
+    reindexer: &dyn Reindexer,
     dry_run: bool,
     out: &mut dyn Write,
 ) -> io::Result<i32> {
-    run_bisync(cfg, host, runner, true, dry_run, out)
+    run_bisync(cfg, host, runner, reindexer, true, dry_run, out)
 }
 
 fn run_bisync(
     cfg: &Config,
     host: &Host,
     runner: &dyn CommandRunner,
+    reindexer: &dyn Reindexer,
     resync: bool,
     dry_run: bool,
     out: &mut dyn Write,
@@ -339,6 +348,12 @@ fn run_bisync(
             EXIT_FAIL
         }
     };
+    if code == EXIT_OK && !dry_run {
+        // Sync is done and stays done; the reindex result is informational.
+        let msg = reindex::request(cfg, host, reindexer).message();
+        writeln!(out, "{name}: {msg}")?;
+        log.line(&msg, out)?;
+    }
     log.line(&format!("end exit={code}"), out)?;
     if let Some(p) = log_path(host) {
         writeln!(out, "{name}: log {}", p.display())?;
@@ -351,7 +366,52 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    use crate::reindex::{ReindexError, ReindexReply};
+    use std::time::Duration;
+
     const SECRET: &str = "FAKE-SUPER-SECRET-ACCESS";
+
+    /// No daemon running: every reindex request is "not listening".
+    struct NoDaemon;
+    impl Reindexer for NoDaemon {
+        fn reindex(&self, _s: &Path, _t: Duration) -> Result<ReindexReply, ReindexError> {
+            Err(ReindexError::NotListening(
+                "No such file or directory".into(),
+            ))
+        }
+    }
+
+    /// Fake daemon: records (socket, timeout) and answers with `reply`.
+    struct FakeDaemon {
+        calls: RefCell<Vec<(PathBuf, Duration)>>,
+        reply: Result<ReindexReply, ReindexError>,
+    }
+    impl FakeDaemon {
+        fn answering(reply: Result<ReindexReply, ReindexError>) -> Self {
+            FakeDaemon {
+                calls: RefCell::new(Vec::new()),
+                reply,
+            }
+        }
+        fn ok() -> Self {
+            Self::answering(Ok(ReindexReply {
+                ok: true,
+                notes: Some(412),
+                chunks: Some(3001),
+                indexing: Some(false),
+                ..Default::default()
+            }))
+        }
+        fn count(&self) -> usize {
+            self.calls.borrow().len()
+        }
+    }
+    impl Reindexer for FakeDaemon {
+        fn reindex(&self, s: &Path, t: Duration) -> Result<ReindexReply, ReindexError> {
+            self.calls.borrow_mut().push((s.to_path_buf(), t));
+            self.reply.clone()
+        }
+    }
 
     /// Fake rclone for bisync tests. Records argv; answers by subcommand.
     struct Fake {
@@ -423,6 +483,8 @@ mod tests {
             cache_dir: Some(dir.path().join("cache")),
             state_dir: Some(dir.path().join("state")),
             is_exec: |_| true,
+            runtime_dir: None,
+            uid: 0,
         };
         let mut cfg = Config::load_from(|_| None, &[], None).unwrap();
         cfg.vault_local = Some(vault);
@@ -450,7 +512,7 @@ mod tests {
     fn sync_happy_path_runs_bisync_without_resync() {
         let (_d, host, cfg) = setup(3);
         let fake = Fake::new();
-        let (code, s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_OK, "{s}");
         assert!(
             s.contains("guards ok: local 3 files, remote 120 files"),
@@ -481,7 +543,7 @@ mod tests {
     fn resync_happy_path_includes_resync() {
         let (_d, host, cfg) = setup(5);
         let fake = Fake::new();
-        let (code, s) = run(|o| resync(&cfg, &host, &fake, true, o));
+        let (code, s) = run(|o| resync(&cfg, &host, &fake, &NoDaemon, true, o));
         assert_eq!(code, EXIT_OK, "{s}");
         let b = fake.bisync_calls();
         assert_eq!(b.len(), 1);
@@ -498,7 +560,7 @@ mod tests {
         let (_d, host, cfg) = setup(2);
         let fake = Fake::new();
         for f in [sync, resync] {
-            let (code, s) = run(|o| f(&cfg, &host, &fake, false, o));
+            let (code, s) = run(|o| f(&cfg, &host, &fake, &NoDaemon, false, o));
             assert_eq!(code, EXIT_FAIL);
             assert!(s.contains("has 2 files, below MIN_FILES=3"), "{s}");
         }
@@ -514,7 +576,7 @@ mod tests {
         let mut fake = Fake::new();
         fake.remote_count = 0;
         for f in [sync, resync] {
-            let (code, s) = run(|o| f(&cfg, &host, &fake, false, o));
+            let (code, s) = run(|o| f(&cfg, &host, &fake, &NoDaemon, false, o));
             assert_eq!(code, EXIT_FAIL);
             assert!(s.contains("remote gdrive:Vault has 0 files"), "{s}");
         }
@@ -527,11 +589,11 @@ mod tests {
         let (d, host, mut cfg) = setup(3);
         let fake = Fake::new();
         cfg.vault_local = Some(d.path().join("nope"));
-        let (code, s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_FAIL);
         assert!(s.contains("missing or not a directory"), "{s}");
         cfg.vault_local = None;
-        let (code, s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_FAIL);
         assert!(s.contains("VAULT_LOCAL is not set"), "{s}");
         assert!(fake.calls.borrow().is_empty());
@@ -547,7 +609,7 @@ mod tests {
              ERROR : Bisync critical error: couldn't refresh token {{\"refresh_token\":\"{SECRET}\"}}\n\
              ERROR : Bisync aborted. Must run --resync to recover.\n"
         );
-        let (code, s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, 7);
         assert!(s.contains("FAILED (rclone exit 7)"), "{s}");
         assert!(s.contains("resync --dry-run"), "{s}");
@@ -567,7 +629,7 @@ mod tests {
              INFO  : Path1:    1 changes:    1 new,    0 newer,    0 older,    0 deleted\n\
              INFO  : Bisync successful\n"
             .into();
-        let (code, _s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, _s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_OK);
         let log = read_log(&host);
         let lines: Vec<&str> = log.lines().collect();
@@ -581,7 +643,7 @@ mod tests {
         assert!(lines.last().unwrap().ends_with("sync end exit=0"), "{log}");
         assert!(!log.contains("diary.md"), "{log}");
         // Appends across runs.
-        run(|o| sync(&cfg, &host, &fake, false, o));
+        run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(read_log(&host).matches("sync start").count(), 2);
     }
 
@@ -594,7 +656,7 @@ mod tests {
         let sync_dir = d.path().join(".config/vault-sync");
         std::fs::create_dir_all(&sync_dir).unwrap();
         std::fs::write(sync_dir.join("filters.txt"), "- .obsidian/cache/**\n").unwrap();
-        let (code, s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_OK, "{s}");
         let b = fake.bisync_calls();
         let want = sync_dir.join("filters.txt").display().to_string();
@@ -603,7 +665,7 @@ mod tests {
             .any(|w| w[0] == "--filters-file" && w[1] == want));
 
         cfg.filters_file = Some(d.path().join("missing.txt"));
-        let (code, s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_FAIL);
         assert!(s.contains("missing.txt does not exist"), "{s}");
         assert_eq!(fake.bisync_calls().len(), 1);
@@ -623,7 +685,7 @@ mod tests {
             }
         }
         let (_d, host, cfg) = setup(3);
-        let (code, s) = run(|o| sync(&cfg, &host, &NoCount, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &NoCount, &NoDaemon, false, o));
         assert_eq!(code, EXIT_FAIL);
         assert!(
             s.contains("cannot count remote files: ERROR : dial tcp"),
@@ -660,7 +722,7 @@ mod tests {
         let (_d, mut host, cfg) = setup(3);
         host.state_dir = None;
         let fake = Fake::new();
-        let (code, s) = run(|o| sync(&cfg, &host, &fake, false, o));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_OK, "{s}");
         assert!(!s.contains("log "), "{s}");
     }
@@ -670,5 +732,141 @@ mod tests {
         assert_eq!(format_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_utc(1_793_358_300), "2026-10-30T11:05:00Z");
         assert_eq!(format_utc(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn successful_sync_reindexes_once_then_ends() {
+        let (_d, mut host, cfg) = setup(3);
+        host.runtime_dir = Some(PathBuf::from("/run/user/1000"));
+        let fake = Fake::new();
+        let daemon = FakeDaemon::ok();
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert_eq!(daemon.count(), 1);
+        let (sock, timeout) = daemon.calls.borrow()[0].clone();
+        assert_eq!(sock, PathBuf::from("/run/user/1000/vault-search.sock"));
+        assert_eq!(timeout, Duration::from_secs(1800));
+        assert!(
+            s.contains("sync: reindex: ok (notes=412 chunks=3001)"),
+            "{s}"
+        );
+        let log = read_log(&host);
+        let lines: Vec<&str> = log.lines().collect();
+        let n = lines.len();
+        assert!(
+            lines[n - 2].ends_with("sync reindex: ok (notes=412 chunks=3001)"),
+            "{log}"
+        );
+        assert!(lines[n - 1].ends_with("sync end exit=0"), "{log}");
+    }
+
+    #[test]
+    fn resync_also_reindexes_and_honours_socket_and_timeout() {
+        let (_d, host, mut cfg) = setup(3);
+        cfg.search_socket = Some(PathBuf::from("/x/vs.sock"));
+        cfg.reindex_timeout_secs = 90;
+        let fake = Fake::new();
+        let daemon = FakeDaemon::ok();
+        let (code, s) = run(|o| resync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert_eq!(
+            daemon.calls.borrow().as_slice(),
+            [(PathBuf::from("/x/vs.sock"), Duration::from_secs(90))]
+        );
+        assert!(s.contains("resync: reindex: ok"), "{s}");
+    }
+
+    #[test]
+    fn dry_run_never_reindexes() {
+        let (_d, host, cfg) = setup(3);
+        let fake = Fake::new();
+        let daemon = FakeDaemon::ok();
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &daemon, true, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        let (code, s2) = run(|o| resync(&cfg, &host, &fake, &daemon, true, o));
+        assert_eq!(code, EXIT_OK, "{s2}");
+        assert_eq!(daemon.count(), 0);
+        assert!(!s.contains("reindex") && !s2.contains("reindex"), "{s}{s2}");
+        assert!(!read_log(&host).contains("reindex"));
+    }
+
+    #[test]
+    fn daemon_not_listening_skips_and_keeps_exit_0() {
+        let (_d, host, cfg) = setup(3);
+        let fake = Fake::new();
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert!(
+            s.contains(
+                "sync: reindex: skipped (vault-searchd not listening on /tmp/vault-search-0.sock"
+            ),
+            "{s}"
+        );
+        let log = read_log(&host);
+        assert!(
+            log.contains("reindex: skipped (vault-searchd not listening"),
+            "{log}"
+        );
+        assert!(log.lines().last().unwrap().ends_with("end exit=0"), "{log}");
+    }
+
+    #[test]
+    fn reindex_ok_false_or_timeout_is_surfaced_but_exit_0() {
+        let (_d, host, cfg) = setup(3);
+        let fake = Fake::new();
+        let daemon = FakeDaemon::answering(Ok(ReindexReply {
+            ok: false,
+            error: Some("embed: http://127.0.0.1:8081 connection refused".into()),
+            ..Default::default()
+        }));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert!(
+            s.contains("sync: reindex: FAILED (embed: http://127.0.0.1:8081 connection refused)"),
+            "{s}"
+        );
+        assert!(read_log(&host).contains("reindex: FAILED (embed:"));
+
+        let daemon = FakeDaemon::answering(Err(ReindexError::Failed(
+            "no reply within 1800s (raise VAULT_REINDEX_TIMEOUT_SECS)".into(),
+        )));
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert!(s.contains("reindex: FAILED (no reply within 1800s"), "{s}");
+    }
+
+    #[test]
+    fn reindex_disabled_by_config() {
+        let (_d, host, mut cfg) = setup(3);
+        cfg.reindex = false;
+        let fake = Fake::new();
+        let daemon = FakeDaemon::ok();
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert_eq!(daemon.count(), 0);
+        assert!(s.contains("reindex: disabled (VAULT_REINDEX=0)"), "{s}");
+    }
+
+    #[test]
+    fn guard_refusal_or_rclone_failure_never_reindexes() {
+        // Guard: too few local files.
+        let (_d, host, cfg) = setup(1);
+        let fake = Fake::new();
+        let daemon = FakeDaemon::ok();
+        let (code, _) = run(|o| sync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, EXIT_FAIL);
+        // Guard: too few remote files.
+        let (_d, host, cfg) = setup(3);
+        let mut fake = Fake::new();
+        fake.remote_count = 0;
+        let (code, _) = run(|o| resync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, EXIT_FAIL);
+        // rclone bisync itself fails.
+        let mut fake = Fake::new();
+        fake.bisync_code = 1;
+        let (code, s) = run(|o| sync(&cfg, &host, &fake, &daemon, false, o));
+        assert_eq!(code, 1, "{s}");
+        assert_eq!(daemon.count(), 0);
+        assert!(!s.contains("reindex"), "{s}");
     }
 }

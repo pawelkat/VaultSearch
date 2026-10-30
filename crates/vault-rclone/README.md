@@ -11,8 +11,8 @@ The policy comes from the vault note **DriveSync Replacement**. The bash `vault-
 | `status [--offline]` | Local path and file count, remote, guard values, config files read, bisync lock files, rclone version, and `rclone size` on the remote. Exit 1 if VAULT_LOCAL is missing, rclone is missing, or the remote is unreachable. |
 | `check-config [--offline]` (alias `auth`) | `rclone.conf` exists, the remote name is listed by `rclone listremotes`, a `token` key is present (value not shown), and `rclone lsd` on the vault works. |
 | `lsf [--local]` | `rclone lsf --max-depth 1 --fast-list <VAULT_REMOTE>` (or `VAULT_LOCAL` with `--local`). Smoke check; prints rclone's output. |
-| `sync [-n/--dry-run]` | Guards, then incremental `rclone bisync`. |
-| `resync [-n/--dry-run]` | Guards, then `rclone bisync --resync --resync-mode newer`. Only for the first run, after rclone exit 7, or after editing the filters file. Run with `--dry-run` first. |
+| `sync [-n/--dry-run]` | Guards, then incremental `rclone bisync`, then (if bisync exited 0 and not `--dry-run`) an incremental reindex request to `vault-searchd`. |
+| `resync [-n/--dry-run]` | Guards, then `rclone bisync --resync --resync-mode newer`. Only for the first run, after rclone exit 7, or after editing the filters file. Run with `--dry-run` first. Reindexes afterwards like `sync`. |
 
 Exit codes: 0 ok; 1 a check failed or a guard refused; 2 bad config. For `sync`, `resync`, and `lsf`, a non-zero rclone exit code is passed through (bisync: 1 retryable, 2 usage, 7 critical, needs `resync`).
 
@@ -49,6 +49,22 @@ rclone [--config RCLONE_CONFIG] bisync <VAULT_REMOTE> <VAULT_LOCAL> \
 - `--resync-mode newer` keeps the newer copy on resync instead of rclone's default "Path1 (Drive) always wins".
 - `--fast-list` is bisync's default already; it is passed explicitly for clarity.
 
+## Reindex after sync
+
+When bisync exits 0 and the run is not `--dry-run`, vault-rclone sends one line, `{"op":"reindex"}` (vault-search's `IpcRequest::Reindex`), to the `vault-searchd` Unix socket and waits for the JSON reply. The daemon re-embeds only notes whose mtime changed with EmbeddingGemma; the index (e.g. `~/.local/share/vault-search/index.db`) is never wiped or opened by this crate, and this crate does not link `vault-search` or sqlite.
+
+- Socket: `VAULT_SEARCH_SOCKET`, else `$XDG_RUNTIME_DIR/vault-search.sock`, else `/tmp/vault-search-$UID.sock` (the daemon's own default).
+- Wait: up to `VAULT_REINDEX_TIMEOUT_SECS` (default 1800) for the reply, since embedding many notes over HTTP takes time. Not vault-search's 8 s client timeout.
+- Result goes to stdout and the run log, just before `end exit=…`:
+  - `reindex: ok (notes=N chunks=M)`
+  - `reindex: skipped (vault-searchd not listening on <socket>: …)`: no socket file or connection refused.
+  - `reindex: FAILED (…)`: daemon replied `ok: false`, timed out, or sent a bad reply.
+  - `reindex: disabled (VAULT_REINDEX=0)`
+- None of these change the exit code. The files are already synced; a later `vault-searchd reindex` or the daemon's own watcher catches up.
+- No reindex after a guard refusal, a non-zero rclone exit, or `--dry-run`.
+
+By hand: `vault-searchd reindex [--socket PATH] [--timeout-secs 1800]` sends the same request.
+
 ## Run log
 
 Each `sync` / `resync` appends to `$XDG_STATE_HOME/vault-rclone/sync.log` (default `~/.local/state/vault-rclone/sync.log`): start (remote, local, dry-run), guard result or refusal, rclone's change totals and verdict, a conflict count, and `end exit=N`. Times are UTC. Per-file lines, note names, rclone.conf, and tokens are never logged; error lines go through the same credential filter as `check-config`. Nothing is written into the vault.
@@ -67,6 +83,9 @@ Read from the environment, then `~/.config/vault-rclone/config.env`, then `~/.co
 | `MIN_FILES` | `3` |
 | `FILTERS_FILE` | first existing of `~/.config/vault-rclone/filters.txt`, `~/.config/vault-sync/filters.txt`; none if neither exists |
 | `CONFLICT_SUFFIX` | `.conflict-{DateOnly}-` (no `/` allowed) |
+| `VAULT_REINDEX` | `1`; `0`/`false`/`no`/`off` skips the post-sync reindex |
+| `VAULT_SEARCH_SOCKET` | `$XDG_RUNTIME_DIR/vault-search.sock`, else `/tmp/vault-search-$UID.sock` |
+| `VAULT_REINDEX_TIMEOUT_SECS` | `1800` |
 
 ## Parity checklist vs bash `vault-sync` (Nitro)
 
@@ -84,4 +103,4 @@ The bash skill scripts (`~/.local/bin/vault-sync`, vault `.grok/skills/vault-syn
 
 ## Tests
 
-Every rclone call goes through the `CommandRunner` trait. Unit tests use a fake runner and never reach Drive.
+Every rclone call goes through the `CommandRunner` trait and every reindex request through the `Reindexer` trait. Unit tests use fakes and never reach Drive or a real daemon; the socket client itself is tested against a throwaway Unix socket in a temp dir.

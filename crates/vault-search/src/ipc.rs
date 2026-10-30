@@ -52,7 +52,18 @@ pub struct IpcResponse {
     pub dim: Option<u32>,
 }
 
+/// One request/response with the default 8 second timeouts (search, status).
 pub fn roundtrip(socket: &std::path::Path, request: &IpcRequest) -> Result<IpcResponse, String> {
+    roundtrip_with_timeout(socket, request, std::time::Duration::from_secs(8))
+}
+
+/// Like [`roundtrip`], but waits up to `read_timeout` for the reply. A
+/// reindex embeds every changed note before answering, so it needs minutes.
+pub fn roundtrip_with_timeout(
+    socket: &std::path::Path,
+    request: &IpcRequest,
+    read_timeout: std::time::Duration,
+) -> Result<IpcResponse, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
@@ -64,7 +75,7 @@ pub fn roundtrip(socket: &std::path::Path, request: &IpcRequest) -> Result<IpcRe
         )
     })?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(read_timeout.max(Duration::from_secs(1))))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(8)))

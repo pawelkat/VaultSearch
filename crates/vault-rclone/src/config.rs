@@ -20,6 +20,9 @@ pub const DEFAULT_MIN_FILES: u32 = 3;
 /// after it, so a losing `note.md` becomes `note.md..conflict-2026-10-30-1`.
 /// `{DateOnly}` is an rclone date macro (Go's `2006-01-02`).
 pub const DEFAULT_CONFLICT_SUFFIX: &str = ".conflict-{DateOnly}-";
+/// How long to wait for `vault-searchd` to finish a post-sync reindex.
+/// Embedding many changed notes over HTTP can take a while.
+pub const DEFAULT_REINDEX_TIMEOUT_SECS: u64 = 1800;
 
 /// Keys this crate reads. Anything else in a config file is ignored and never printed.
 pub const KNOWN_KEYS: &[&str] = &[
@@ -31,6 +34,9 @@ pub const KNOWN_KEYS: &[&str] = &[
     "MIN_FILES",
     "FILTERS_FILE",
     "CONFLICT_SUFFIX",
+    "VAULT_SEARCH_SOCKET",
+    "VAULT_REINDEX",
+    "VAULT_REINDEX_TIMEOUT_SECS",
 ];
 
 /// Resolved settings. Holds paths only, never credentials.
@@ -49,6 +55,13 @@ pub struct Config {
     pub filters_file: Option<PathBuf>,
     /// `--conflict-suffix` passed to bisync.
     pub conflict_suffix: String,
+    /// `VAULT_REINDEX`: ask `vault-searchd` to reindex after a successful
+    /// sync/resync. `0`, `false`, `no`, or `off` disables it.
+    pub reindex: bool,
+    /// `VAULT_SEARCH_SOCKET`; `None` means the daemon's default socket.
+    pub search_socket: Option<PathBuf>,
+    /// `VAULT_REINDEX_TIMEOUT_SECS`: read timeout for the reindex reply.
+    pub reindex_timeout_secs: u64,
     /// Config files that existed and were read, lowest precedence first.
     pub files_read: Vec<PathBuf>,
 }
@@ -114,6 +127,13 @@ impl Config {
             min_files: number(get("MIN_FILES"), "MIN_FILES", DEFAULT_MIN_FILES)?,
             filters_file: path_of("FILTERS_FILE"),
             conflict_suffix,
+            reindex: flag(get("VAULT_REINDEX"), "VAULT_REINDEX", true)?,
+            search_socket: path_of("VAULT_SEARCH_SOCKET"),
+            reindex_timeout_secs: number(
+                get("VAULT_REINDEX_TIMEOUT_SECS"),
+                "VAULT_REINDEX_TIMEOUT_SECS",
+                DEFAULT_REINDEX_TIMEOUT_SECS,
+            )?,
             files_read,
         })
     }
@@ -197,7 +217,23 @@ pub fn expand_home(v: &str, home: Option<&Path>) -> PathBuf {
     PathBuf::from(v)
 }
 
-fn number(v: Option<&str>, key: &'static str, default: u32) -> Result<u32, Error> {
+fn flag(v: Option<&str>, key: &'static str, default: bool) -> Result<bool, Error> {
+    match v.map(str::to_ascii_lowercase).as_deref() {
+        None => Ok(default),
+        Some("1" | "true" | "yes" | "on") => Ok(true),
+        Some("0" | "false" | "no" | "off") => Ok(false),
+        Some(other) => Err(Error::BadFlag {
+            key,
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn number<T: std::str::FromStr>(
+    v: Option<&str>,
+    key: &'static str,
+    default: T,
+) -> Result<T, Error> {
     match v {
         None => Ok(default),
         Some(s) => s.parse().map_err(|_| Error::BadNumber {
@@ -259,6 +295,31 @@ mod tests {
         assert!(matches!(c.require_local(), Err(Error::MissingLocal)));
         assert_eq!(c.conflict_suffix, ".conflict-{DateOnly}-");
         assert!(c.filters_file.is_none());
+        assert!(c.reindex);
+        assert!(c.search_socket.is_none());
+        assert_eq!(c.reindex_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn reindex_keys() {
+        let env = |k: &str| match k {
+            "VAULT_REINDEX" => Some("off".to_string()),
+            "VAULT_SEARCH_SOCKET" => Some("~/run/vs.sock".to_string()),
+            "VAULT_REINDEX_TIMEOUT_SECS" => Some("60".to_string()),
+            _ => None,
+        };
+        let c = Config::load_from(env, &[], Some(Path::new("/h"))).unwrap();
+        assert!(!c.reindex);
+        assert_eq!(
+            c.search_socket.as_deref(),
+            Some(Path::new("/h/run/vs.sock"))
+        );
+        assert_eq!(c.reindex_timeout_secs, 60);
+        let bad = |k: &str| (k == "VAULT_REINDEX").then(|| "maybe".to_string());
+        assert!(matches!(
+            Config::load_from(bad, &[], None),
+            Err(Error::BadFlag { .. })
+        ));
     }
 
     #[test]

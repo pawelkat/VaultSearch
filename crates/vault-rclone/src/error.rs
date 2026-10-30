@@ -11,6 +11,8 @@ pub enum Error {
     },
     #[error("{key} must be a non-negative whole number, got {value:?}")]
     BadNumber { key: &'static str, value: String },
+    #[error("{key} must be 0/1, true/false, yes/no, or on/off, got {value:?}")]
+    BadFlag { key: &'static str, value: String },
     #[error("VAULT_REMOTE must look like `remote:path` (e.g. gdrive:Vault), got {0:?}")]
     BadRemote(String),
     #[error("VAULT_REMOTE {0:?} points at the remote root; only a vault folder is allowed")]
