@@ -71,6 +71,33 @@ pub struct IpcSyncStatus {
     pub last_reindex: Option<String>,
 }
 
+/// Filesystem watch health of `vault-searchd serve` (notify / inotify on the
+/// vault, debounced into an incremental reindex; the 60s rescan stays as the
+/// fallback). Every field is optional on the wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct IpcWatchStatus {
+    /// `false` when serve ran with `--no-watch`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `true` when the watcher started; `false` means 60s rescan only.
+    #[serde(default)]
+    pub ok: bool,
+    /// Why the watcher could not start (inotify limit, permission, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub debounce_ms: u64,
+    /// Relevant change events seen since serve started.
+    #[serde(default)]
+    pub events: u64,
+    /// Reindex passes the watcher ran (not counting busy skips).
+    #[serde(default)]
+    pub reindexes: u64,
+    /// Unix seconds (UTC) the last watch-triggered reindex finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reindex_unix: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct IpcResponse {
     pub ok: bool,
@@ -99,6 +126,9 @@ pub struct IpcResponse {
     /// Sync health (status only; absent from daemons older than PR4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<IpcSyncStatus>,
+    /// Vault watch health (status only; absent from daemons without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<IpcWatchStatus>,
 }
 
 /// One request/response with the default 8 second timeouts (search, status).

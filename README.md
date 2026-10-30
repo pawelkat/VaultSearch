@@ -45,9 +45,11 @@ cargo install --path crates/vault-search-mcp --root "$HOME/.local"
 The embedder listens on localhost and must not add its own task prefix. These strings are already prefixed. `contrib/embed_server.py` is an optional CPU FP32 server for EmbeddingGemma 2 text-only. It is not started by the build, and it downloads the model on first run:
 
 ```bash
-python3 -m pip install -U sentence-transformers transformers torch
+python3 -m pip install -U sentence-transformers transformers torch torchvision Pillow
 python3 contrib/embed_server.py
 ```
+
+`torchvision` and `Pillow` are needed even for text: loading the EmbeddingGemma 2 processor imports its image processor.
 
 Then, in another terminal:
 
@@ -59,7 +61,7 @@ vault-searchd serve \
   --dim 768
 ```
 
-The socket is `$XDG_RUNTIME_DIR/vault-search.sock` (mode 0600). A user systemd unit is `contrib/vault-searchd.service`. It is not installed by the build.
+The socket is `$XDG_RUNTIME_DIR/vault-search.sock` (mode 0600), or `/tmp/vault-search-$UID.sock` when `XDG_RUNTIME_DIR` is unset; `serve`, `query`, `reindex`, `status`, and the MCP server must agree on it (same `XDG_RUNTIME_DIR`, or pass `--socket`). `serve` watches the vault (inotify via `notify`) and reindexes about half a second after a note changes; the 60 s mtime scan stays as the fallback. A user systemd unit is `contrib/vault-searchd.service`. It is not installed by the build.
 
 Ask the daemon without a model in the middle:
 
@@ -123,7 +125,8 @@ contrib/embed_server.py (127.0.0.1:8081)
 vault-searchd serve --sync-interval 120
         |-- every 120 s: vault-rclone guarded bisync  (gdrive:Vault <-> --vault)
         |                then, only if it exited 0: incremental reindex in-process
-        |-- every 60 s:  mtime scan + incremental reindex (as before)
+        |-- vault watch:  note written on disk -> ~0.5 s debounce -> incremental reindex
+        |-- every 60 s:  mtime scan + incremental reindex (fallback)
         `-- unix socket: search / reindex / status
 ```
 
@@ -148,10 +151,12 @@ How it behaves:
 - The sync runs on its own thread; the socket keeps answering while bisync or the reindex runs. The first sync starts at once, the next one `N` seconds after the previous one finished.
 - A failed sync (guard refusal, rclone non-zero, rclone missing) is logged and shown in `status`; serve keeps running, that cycle skips the reindex, and the next cycle tries again.
 - After a successful sync the daemon reindexes in-process (no socket hop to itself). A failed reindex, e.g. the embedder is down, is reported as `after sync: reindex: FAILED (...)` but the sync still counts as ok: the files are synced. `VAULT_REINDEX=0` turns the post-sync reindex off; the 60 s scan still picks changes up.
+- Local writes (an editor, GalAnonim, a script, or the sync itself) are picked up by a recursive filesystem watch on `--vault` (`notify`: inotify on Linux, FSEvents on macOS). Changes to `.md` / `.markdown` files and folders are debounced (`--watch-debounce-ms`, default 500; a steady stream still fires at least every 5 s) into one incremental reindex, normally within a second or two. Dot-dirs (`.obsidian`, `.trash`, rclone temp files) and non-markdown files are ignored, like the scan. If a reindex is already running the watch retries until it gets its own pass, and writes during its pass schedule one more. A failed reindex is logged and shown as the index error; the next change or the 60 s scan retries.
+- The 60 s mtime scan stays as the fallback for missed events, inotify queue overflow, and filesystems without notify. If the watch cannot start (e.g. `fs.inotify.max_user_watches` too low, permission), serve logs `watch unavailable, 60s rescan only: ...`, shows `watch: FAILED (...)` in `status`, and keeps serving. `--no-watch` turns it off. The post-sync reindex does not depend on the watch.
 - The index stays outside the vault; serve refuses an index path inside it, so bisync cannot upload it.
 - Run one sync owner per machine. Stop the bash `vault-sync` timer (or any `vault-rclone sync` cron) before turning `--sync-interval` on.
 - The `vault-rclone` CLI stays for sync-only hosts and debugging (`vault-rclone status`, `sync --dry-run`, `resync`).
 
-`vault-searchd status` prints the socket, vault, index counts (`notes`, `chunks`, `dim`, indexing now), the last index error, whether the embedder accepts connections, and the sync health: enabled and interval, remote and local, runs and failures, last sync time (UTC) and exit code, last ok sync, last sync error, and the reindex result after the last good sync. The same fields are in the `{"op":"status"}` reply as optional JSON fields (`vault`, `embed_ok`, `embed_url`, `sync{…}`), so older clients keep working and older daemons simply omit them.
+`vault-searchd status` prints the socket, vault, index counts (`notes`, `chunks`, `dim`, indexing now), the last index error, whether the embedder accepts connections, and the sync health: enabled and interval, remote and local, runs and failures, last sync time (UTC) and exit code, last ok sync, last sync error, and the reindex result after the last good sync, plus the vault watch (on / FAILED / off, debounce, events, watch-triggered reindexes). The same fields are in the `{"op":"status"}` reply as optional JSON fields (`vault`, `embed_ok`, `embed_url`, `sync{…}`, `watch{…}`), so older clients keep working and older daemons simply omit them.
 
 User systemd units (not installed or enabled by the build): `contrib/vault-embed.service` and `contrib/vault-searchd.service`; the latter has the `--sync-interval 120` line commented out.

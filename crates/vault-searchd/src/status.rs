@@ -50,6 +50,31 @@ pub fn render(socket: &Path, r: &IpcResponse) -> String {
         }
         _ => {}
     }
+    match &r.watch {
+        None => {}
+        Some(w) if w.ok => {
+            let _ = writeln!(
+                s,
+                "watch:    on (debounce {}ms, {} events, {} reindexes{}), 60s rescan fallback",
+                w.debounce_ms,
+                w.events,
+                w.reindexes,
+                w.last_reindex_unix
+                    .map(|t| format!(", last {}", format_utc(t)))
+                    .unwrap_or_default()
+            );
+        }
+        Some(w) if w.enabled => {
+            let _ = writeln!(
+                s,
+                "watch:    FAILED ({}), 60s rescan only",
+                w.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        Some(_) => {
+            let _ = writeln!(s, "watch:    off (--no-watch), 60s rescan only");
+        }
+    }
     match &r.sync {
         None => {
             let _ = writeln!(s, "sync:     unknown (daemon predates integrated sync)");
@@ -142,6 +167,49 @@ mod tests {
         ] {
             assert!(s.contains(want), "missing {want:?} in:\n{s}");
         }
+    }
+
+    #[test]
+    fn renders_watch_health() {
+        let on = IpcResponse {
+            ok: true,
+            watch: Some(vault_search::IpcWatchStatus {
+                enabled: true,
+                ok: true,
+                debounce_ms: 500,
+                events: 4,
+                reindexes: 2,
+                last_reindex_unix: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let s = render(Path::new("/s"), &on);
+        assert!(
+            s.contains(
+                "watch:    on (debounce 500ms, 4 events, 2 reindexes, last 1970-01-01T00:00:00Z)"
+            ),
+            "{s}"
+        );
+        let failed = IpcResponse {
+            watch: Some(vault_search::IpcWatchStatus {
+                enabled: true,
+                error: Some("inotify watch limit reached".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let s = render(Path::new("/s"), &failed);
+        assert!(
+            s.contains("watch:    FAILED (inotify watch limit reached), 60s rescan only"),
+            "{s}"
+        );
+        let off = IpcResponse {
+            watch: Some(vault_search::IpcWatchStatus::default()),
+            ..Default::default()
+        };
+        assert!(render(Path::new("/s"), &off).contains("watch:    off (--no-watch)"));
+        assert!(!render(Path::new("/s"), &IpcResponse::default()).contains("watch:"));
     }
 
     #[test]

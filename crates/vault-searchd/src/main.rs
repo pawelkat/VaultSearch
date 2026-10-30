@@ -1,6 +1,7 @@
 mod embed;
 mod status;
 mod sync;
+mod watch;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -19,7 +20,7 @@ use vault_rclone::SystemRunner;
 use vault_search::{
     chunk_markdown, document_prefix, format_hits, indexable_bytes, indexable_path, query_prefix,
     require_index_outside_vault, roundtrip, roundtrip_with_timeout, Chunk, Hit, Index, IpcHit,
-    IpcRequest, IpcResponse, IpcSyncStatus, Stamp, MAX_FILE_BYTES,
+    IpcRequest, IpcResponse, IpcSyncStatus, IpcWatchStatus, Stamp, MAX_FILE_BYTES,
 };
 
 use crate::embed::HttpEmbedder;
@@ -72,6 +73,12 @@ struct ServeArgs {
     /// VAULT_LOCAL is always replaced by --vault.
     #[arg(long, value_name = "FILE")]
     sync_config: Option<PathBuf>,
+    /// Do not watch the vault for changes; rely on the 60s rescan only.
+    #[arg(long)]
+    no_watch: bool,
+    /// Coalesce vault change events for this long before reindexing.
+    #[arg(long, default_value_t = 500, value_name = "MS")]
+    watch_debounce_ms: u64,
 }
 
 #[derive(clap::Args)]
@@ -172,6 +179,7 @@ struct App {
     indexing: AtomicBool,
     last_error: Mutex<Option<String>>,
     sync: Arc<Mutex<IpcSyncStatus>>,
+    watch: Arc<Mutex<IpcWatchStatus>>,
 }
 
 fn serve(args: ServeArgs) -> Result<(), String> {
@@ -207,6 +215,7 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         indexing: AtomicBool::new(false),
         last_error: Mutex::new(None),
         sync: Arc::new(Mutex::new(sync::initial_status(sync_job.as_ref()))),
+        watch: Arc::new(Mutex::new(watch::off_status(None))),
     });
     let scanner = Arc::clone(&app);
     std::thread::spawn(move || loop {
@@ -216,6 +225,8 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_secs(60));
     });
+    // Keep the watcher alive for as long as serve runs.
+    let _watch = start_watch(&app, args.no_watch, args.watch_debounce_ms);
     match sync_job {
         None => eprintln!("vault-searchd: sync off (--sync-interval 0)"),
         Some(job) => {
@@ -252,6 +263,42 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+/// Watch the vault and reindex shortly after local writes. Never fatal: on
+/// failure serve keeps the 60s rescan and says so in the log and `status`.
+fn start_watch(app: &Arc<App>, off: bool, debounce_ms: u64) -> Option<watch::Watch> {
+    if off {
+        eprintln!("vault-searchd: watch off (--no-watch); 60s rescan only");
+        return None;
+    }
+    let cfg = watch::Debounce::from_millis(debounce_ms);
+    let reindexer = Arc::clone(app);
+    let fire = move || {
+        reindex(&reindexer).inspect_err(|err| {
+            eprintln!("vault-searchd: reindex (watch): {err}");
+            if let Ok(mut last) = reindexer.last_error.lock() {
+                *last = Some(err.clone());
+            }
+        })
+    };
+    match watch::spawn(&app.vault, cfg, fire, Arc::clone(&app.watch)) {
+        Ok(w) => {
+            eprintln!(
+                "vault-searchd: watching {} (debounce {}ms, 60s rescan fallback)",
+                app.vault.display(),
+                cfg.quiet.as_millis()
+            );
+            Some(w)
+        }
+        Err(err) => {
+            eprintln!("vault-searchd: watch unavailable, 60s rescan only: {err}");
+            if let Ok(mut h) = app.watch.lock() {
+                *h = watch::off_status(Some(err));
+            }
+            None
+        }
+    }
 }
 
 fn handle_conn(app: &App, stream: UnixStream) -> Result<(), String> {
@@ -328,6 +375,7 @@ fn status(app: &App) -> IpcResponse {
         embed_ok: Some(app.embedder.reachable(Duration::from_millis(500))),
         embed_url: Some(app.embedder.url().to_string()),
         sync: app.sync.lock().ok().map(|s| s.clone()),
+        watch: app.watch.lock().ok().map(|w| w.clone()),
         ..Default::default()
     }
 }

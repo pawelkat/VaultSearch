@@ -4,7 +4,10 @@
 The Rust daemon already applies the VaultHome prefixes. This process must not
 add a second prompt. Vision and audio stay unloaded. FP32 only.
 
-    python3 -m pip install -U sentence-transformers transformers torch
+    python3 -m pip install -U sentence-transformers transformers torch torchvision Pillow
+
+torchvision and Pillow are required even for text-only use: loading the
+EmbeddingGemma 2 processor imports its image processor.
     python3 contrib/embed_server.py
 """
 
