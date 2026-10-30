@@ -1,0 +1,21 @@
+[package]
+name = "vault-rclone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Vault-only wrapper around the rclone binary: config, status, and auth checks"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vault-rclone"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

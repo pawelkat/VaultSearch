@@ -100,3 +100,12 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 | `vault-search-ffi` | UniFFI `cdylib`. |
 | `vault-searchd` | Daemon and `query` client. |
 | `vault-search-mcp` | Line-delimited JSON-RPC, protocol `2024-11-05`. |
+| `vault-rclone` | Vault-only wrapper around the `rclone` binary. |
+
+## Vault sync (rclone)
+
+`crates/vault-rclone` wraps the `rclone` binary for `gdrive:Vault` only. It follows the vault note DriveSync Replacement: one vault folder, no whole-Drive sync, no mount, and no tokens in output. This release has `status` and `check-config`. `sync` and `resync` come later, so keep using the bash `vault-sync` for now. See [crates/vault-rclone/README.md](crates/vault-rclone/README.md).
+
+```bash
+cargo run -p vault-rclone -- status
+```
