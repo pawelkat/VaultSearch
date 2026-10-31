@@ -2,7 +2,7 @@
 
 A thin, vault-only wrapper around the `rclone` binary. It syncs one thing: `gdrive:Vault` against one local folder. It never touches the whole Drive, never mounts, and never reads or prints OAuth tokens. rclone keeps doing the Drive work and owns `rclone.conf`.
 
-The policy comes from the vault note **DriveSync Replacement**. The bash `vault-sync` skill stays in production until this crate has survived real edits.
+The policy comes from the vault note **DriveSync Replacement**. On the desktop, `vault-searchd serve --sync-interval` is the production sync. It calls this crate's guarded bisync. The bash `vault-sync` timer stays off on that machine.
 
 ## Commands
 
@@ -23,7 +23,7 @@ cargo run -p vault-rclone -- resync --dry-run   # first run on a machine
 cargo run -p vault-rclone -- sync
 ```
 
-**Production is still the bash `vault-sync`.** Use this binary by hand, side by side, until it has survived real edits. Do not point Termux, Autosync, or a timer at it yet.
+One sync owner per machine. Do not also run the bash timer, `vault-watch`, or a cron `vault-rclone sync` on a host whose `vault-searchd` has `--sync-interval` set. Another device (the phone) still syncs its own copy. On the desktop the CLI is for `status`, a dry-run, and the one-time `resync` below.
 
 ## Guards (sync and resync)
 
@@ -43,7 +43,7 @@ rclone [--config RCLONE_CONFIG] bisync <VAULT_REMOTE> <VAULT_LOCAL> \
   [--filters-file <file>] [--resync --resync-mode newer] [--dry-run]
 ```
 
-- Path1 is the remote and Path2 the local folder, as on Nitro, so the listing files in `~/.cache/rclone/bisync` have the same names.
+- Path1 is the remote and Path2 is the local folder. Listing files in `~/.cache/rclone/bisync` are named from that order. The old bash `vault-sync` on Nitro ran `bisync <local> <remote>`, so its listings do not match. The first switch exits 7 (`Must run --resync`) until the cutover below.
 - `--max-delete` is always passed. For `bisync` it is a **percentage** of files (rclone default 50%), not a count as it is for `rclone sync`. The default `MAX_DELETE=50` therefore matches rclone's own default; set it lower to be stricter.
 - Conflicts: the newer file wins, the loser is renamed, not deleted. With the default `CONFLICT_SUFFIX=.conflict-{DateOnly}-` a losing `note.md` becomes `note.md..conflict-2026-10-30-1` (rclone adds the leading `.` and the number). `{DateOnly}` is an rclone date macro. The existing vault file `2026-10-23.md..conflict-Date1` suggests the bash script passes `.conflict-{Date}`, which rclone does not expand (it writes the literal `Date`); set `CONFLICT_SUFFIX=.conflict-{Date}` for an exact match.
 - `--resync-mode newer` keeps the newer copy on resync instead of rclone's default "Path1 (Drive) always wins".
@@ -71,7 +71,7 @@ Each `sync` / `resync` appends to `$XDG_STATE_HOME/vault-rclone/sync.log` (defau
 
 ## Settings
 
-Read from the environment, then `~/.config/vault-rclone/config.env`, then `~/.config/vault-sync/config.env` (the bash skill's file, for drop-in reuse), then defaults. `--config FILE` replaces both files. Files use `KEY=value` lines; `export`, quotes, and `#` comments are fine. Unknown keys are ignored and never printed.
+Read from `~/.config/vault-sync/config.env`, then `~/.config/vault-rclone/config.env` (this file wins on the same key), then the environment (wins over both). `--config FILE` replaces both files. Files use `KEY=value` lines; `export`, quotes, and `#` comments are fine. Unknown keys are ignored and never printed. The bash file's `VAULT_MAX_DELETE` and `VAULT_MIN_FILES` are unknown here; set `MAX_DELETE` and `MIN_FILES`.
 
 | Key | Default |
 |---|---|
@@ -87,19 +87,33 @@ Read from the environment, then `~/.config/vault-rclone/config.env`, then `~/.co
 | `VAULT_SEARCH_SOCKET` | `$XDG_RUNTIME_DIR/vault-search.sock`, else `/tmp/vault-search-$UID.sock` |
 | `VAULT_REINDEX_TIMEOUT_SECS` | `1800` |
 
-## Parity checklist vs bash `vault-sync` (Nitro)
+## Cut over from bash `vault-sync`
 
-The bash skill scripts (`~/.local/bin/vault-sync`, vault `.grok/skills/vault-sync`) were **not readable** when this was written, so the flags above follow the DriveSync Replacement note and the Nitro as-built note. Before trusting this over the bash script, compare on Nitro:
+Stop the other owner first (`vault-sync.timer`, `vault-sync.service`, `vault-watch.service`, or any cron). Then:
 
-- [ ] Path order: bash also runs `bisync gdrive:Vault <local>` (Path1 = remote)? If reversed, the bisync listings differ and the first run here needs `resync`.
-- [ ] Conflict flags: `--conflict-resolve`, `--conflict-loser`, `--conflict-suffix` match (set `CONFLICT_SUFFIX` to the bash value).
-- [ ] `--max-delete` value and meaning (percentage in bisync).
-- [ ] Filters file path and contents (`.obsidian` caches, `.trash`, ...); same file means no forced resync.
-- [ ] Extra flags in bash not here: `--resilient`, `--recover`, `--max-lock`, `--check-access`, `--create-empty-src-dirs`, `--drive-skip-gdocs`, `--compare`, `--track-renames`, `--log-file`. Any of these change behaviour; add them here before cut-over.
-- [ ] Empty-side threshold (`MIN_FILES`) and how bash counts files.
-- [ ] Lock handling and what bash does on exit 7.
-- [ ] Whether bash writes a summary into `Vault/Reviews/` (this crate does not).
-- [ ] `vault-rclone sync --dry-run` on a quiet vault reports no changes right after a bash run.
+```bash
+# ~/.config/vault-rclone/config.env
+VAULT_LOCAL=$HOME/Obsidian/Vault
+VAULT_REMOTE=gdrive:Vault
+RCLONE_BIN=$HOME/.local/bin/rclone
+MAX_DELETE=50
+MIN_FILES=3
+FILTERS_FILE=$HOME/.config/vault-sync/filters.txt
+CONFLICT_SUFFIX=.conflict-{Date}
+```
+
+`vault-rclone check-config`, then `vault-rclone resync --dry-run`. If both sides are at or above `MIN_FILES` and the dry-run is not a wipe, run `vault-rclone resync` once. That writes the remote-then-local listings. After it exits 0, `vault-searchd serve --sync-interval 120 --sync-config ~/.config/vault-rclone/config.env` owns the vault. Do not `--resync` when either side is below `MIN_FILES`.
+
+Nitro did this on 2026-10-31. The first incremental sync exited 7 because of the path order above (739 local files, 798 remote). The dry-run resync succeeded, the real resync succeeded, and the following interval sync reported no changes.
+
+Known differences from that bash script, left as-is after the clean incremental run:
+
+- No `--resilient`, `--recover`, `--max-lock`, `--create-empty-src-dirs`, `--compare size,modtime`, `--drive-skip-gdocs`, or `--fix-case`.
+- `--conflict-loser num`, not `pathname`. Set `CONFLICT_SUFFIX=.conflict-{Date}` to keep the bash loser name. The crate default is `.conflict-{DateOnly}-`.
+- `--max-delete` is a bisync percentage. `50` matches the bash value and rclone's own default.
+- Same filters file (`~/.config/vault-sync/filters.txt`) when `FILTERS_FILE` points at it.
+- This crate does not write a summary into `Vault/Reviews/`.
+- Exit 7 does not auto-resync. The bash script could force `--resync` after repeated failures. Here a human runs `resync --dry-run` first.
 
 ## Tests
 

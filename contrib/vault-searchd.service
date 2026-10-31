@@ -11,7 +11,7 @@ After=default.target vault-embed.service
 [Service]
 Type=simple
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-# Search only (sync handled elsewhere, e.g. the bash vault-sync on Nitro):
+# Search only (some other process owns sync). Nitro does not use this line.
 ExecStart=%h/.local/bin/vault-searchd serve --vault %h/Obsidian/Vault --index %h/.local/share/vault-search/index.db --embed-url http://127.0.0.1:8081/v1/embeddings --dim 768
 # Integrated desktop: also run the guarded vault-rclone bisync every 120 s,
 # then an incremental reindex. Reads ~/.config/vault-rclone/config.env (or
