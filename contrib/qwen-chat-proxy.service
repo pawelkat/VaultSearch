@@ -10,6 +10,8 @@ Wants=llama-server.service
 Type=simple
 ExecStart=/usr/bin/python3 %h/projects/VaultSearch/contrib/chat_proxy.py
 Environment="VAULT_NOTE=%h/Obsidian/Vault/System/Nitro5 Qwen.md"
+Environment=VAULT_ROOT=%h/Obsidian/Vault
+Environment=PUBLIC_BASE=https://nitro5.tailf52603.ts.net
 Environment=UPSTREAM=http://127.0.0.1:8080
 Environment=BIND=127.0.0.1
 Environment=PORT=8082

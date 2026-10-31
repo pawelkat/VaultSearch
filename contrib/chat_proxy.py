@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from calendar import month_name
 from datetime import datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 HOST = os.environ.get("BIND", "127.0.0.1")
@@ -32,7 +33,15 @@ NOTE = Path(
         str(Path.home() / "Obsidian/Vault/System/Nitro5 Qwen.md"),
     )
 )
+VAULT_ROOT = Path(
+    os.environ.get("VAULT_ROOT", str(Path.home() / "Obsidian/Vault"))
+).resolve()
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "https://nitro5.tailf52603.ts.net").rstrip("/")
+VAULT_URL_PREFIX = "/vault/"
 ZONE = ZoneInfo("Europe/Zurich")
+PATH_IN_TEXT = re.compile(
+    r"(?<![\w./])((?:Notes|Daily|Inbox|System|Archive)/[^\s\]\)\"'<>]+?\.md)"
+)
 
 CHAT_PATHS = {
     "/v1/chat/completions",
@@ -93,9 +102,71 @@ def date_block(now: datetime) -> str:
     )
 
 
+def source_link_block() -> str:
+    return (
+        "Source links are required whenever you use vault_search.\n"
+        f"Prefix each tool `path:` with {PUBLIC_BASE}{VAULT_URL_PREFIX}\n"
+        "Example: path Notes/nitro5.md becomes "
+        f"[nitro5]({PUBLIC_BASE}{VAULT_URL_PREFIX}Notes/nitro5.md)\n"
+        "End the answer with a Sources section, one link per path. "
+        "Never invent a path."
+    )
+
+
 def system_text(note: str, now: datetime) -> str:
-    body = note.strip()
-    return f"{body}\n\n{date_block(now)}" if body else date_block(now)
+    parts = [p for p in (note.strip(), date_block(now), source_link_block()) if p]
+    return "\n\n".join(parts)
+
+
+def resolve_vault_file(root: Path, url_path: str) -> Path | None:
+    """Map /vault/<rel> to a file inside root. None if unsafe or not a file."""
+    raw = unquote(url_path.split("?", 1)[0])
+    if not raw.startswith(VAULT_URL_PREFIX):
+        return None
+    rel = raw[len(VAULT_URL_PREFIX) :]
+    if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/"):
+        return None
+    parts = Path(rel).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return None
+    root_resolved = root.resolve()
+    candidate = (root_resolved / rel).resolve()
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def content_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in {".md", ".txt", ".csv"}:
+        return "text/plain; charset=utf-8"
+    if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
+        kind = "jpeg" if ext == ".jpg" else ext[1:]
+        return f"image/{kind}"
+    if ext == ".pdf":
+        return "application/pdf"
+    return "application/octet-stream"
+
+
+def ensure_source_links(text: str) -> str:
+    """Add a Sources list when the reply names vault paths but no /vault/ link."""
+    if VAULT_URL_PREFIX in text:
+        return text
+    seen: list[str] = []
+    for match in PATH_IN_TEXT.findall(text):
+        if match not in seen:
+            seen.append(match)
+    if not seen:
+        return text
+    lines = ["", "Sources:"]
+    for rel in seen:
+        title = Path(rel).stem
+        lines.append(f"- [{title}]({PUBLIC_BASE}{VAULT_URL_PREFIX}{rel})")
+    return text.rstrip() + "\n" + "\n".join(lines) + "\n"
 
 
 def inject_messages(payload: dict, prompt: str) -> dict:
@@ -142,10 +213,35 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
 
     def do_GET(self) -> None:
+        if self._serve_vault(head=False):
+            return
         self._proxy()
 
     def do_HEAD(self) -> None:
+        if self._serve_vault(head=True):
+            return
         self._proxy()
+
+    def _serve_vault(self, head: bool) -> bool:
+        path = unquote(self.path.split("?", 1)[0])
+        if path.rstrip("/") == "/vault":
+            self.send_error(404, "name a note under /vault/")
+            return True
+        if not path.startswith(VAULT_URL_PREFIX):
+            return False
+        file_path = resolve_vault_file(VAULT_ROOT, path)
+        if file_path is None:
+            self.send_error(404, "not in the vault")
+            return True
+        data = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type(file_path))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not head:
+            self.wfile.write(data)
+        return True
 
     def do_POST(self) -> None:
         self._proxy()
@@ -179,13 +275,34 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(502, f"upstream unavailable: {exc}")
             conn.close()
             return
+        rewrite = (
+            self.command == "POST"
+            and path in CHAT_PATHS
+            and b'"stream": true' not in body
+            and b'"stream":true' not in body
+        )
+        raw = None
+        if rewrite:
+            raw = resp.read()
+            try:
+                payload = json.loads(raw)
+                message = payload["choices"][0]["message"]
+                if isinstance(message.get("content"), str):
+                    message["content"] = ensure_source_links(message["content"])
+                    raw = json.dumps(payload).encode("utf-8")
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                pass
         self.send_response(resp.status)
         for key, value in resp.getheaders():
             if key.lower() not in HOP:
                 self.send_header(key, value)
+        if raw is not None:
+            self.send_header("Content-Length", str(len(raw)))
         self.send_header("Connection", "close")
         self.end_headers()
-        if self.command == "HEAD":
+        if self.command == "HEAD" or raw is not None:
+            if raw is not None and self.command != "HEAD":
+                self.wfile.write(raw)
             resp.close()
             conn.close()
             return
@@ -234,6 +351,24 @@ def self_test() -> None:
     assert "2026-10-31" in messages[0]["content"]
     assert "be brief" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "hi"}
+    assert f"{PUBLIC_BASE}/vault/Notes/nitro5.md" in messages[0]["content"]
+    linked = ensure_source_links("See Notes/nitro5.md for the host.")
+    assert f"{PUBLIC_BASE}/vault/Notes/nitro5.md" in linked
+    assert ensure_source_links(linked) == linked
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        note = root / "Notes"
+        note.mkdir()
+        (note / "A.md").write_text("hello", encoding="utf-8")
+        outside = root.parent / "secret.md"
+        found = resolve_vault_file(root, "/vault/Notes/A.md")
+        assert found == (note / "A.md").resolve()
+        assert resolve_vault_file(root, "/vault/Notes/../../secret.md") is None
+        assert resolve_vault_file(root, "/vault/../secret.md") is None
+        assert resolve_vault_file(root, "/health") is None
+        assert not outside.exists() or resolve_vault_file(root, "/vault/../secret.md") is None
     print("self-test ok")
 
 
