@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from calendar import month_name
 from datetime import datetime, timedelta
@@ -97,8 +98,14 @@ def date_block(now: datetime) -> str:
         f"Last week ≈ {week_start.isoformat()} to {yesterday.isoformat()}.\n"
         f"Last month = {month_name[month]} {month_year}.\n"
         f"Last year = {today.year - 1}.\n"
-        'Use these exact dates for "today", "yesterday", "last week", '
-        '"last month", "last year". Never invent a date.'
+        "These dates override anything you remember. "
+        "A remembered date such as 2026-10-14 is wrong.\n"
+        "Before answering about today, yesterday, last week, last month, "
+        "last year, or what was done on a day, call vault_search. "
+        f"For yesterday the query is Daily/{yesterday.isoformat()}. "
+        f"For today the query is Daily/{today.isoformat()}. "
+        "Do not answer that question until the tool result is back. "
+        "Use only this date block and that tool result."
     )
 
 
@@ -115,7 +122,8 @@ def source_link_block() -> str:
 
 
 def system_text(note: str, now: datetime) -> str:
-    parts = [p for p in (note.strip(), date_block(now), source_link_block()) if p]
+    # Date block last so the live dates and the tool rule sit next to the question.
+    parts = [p for p in (note.strip(), source_link_block(), date_block(now)) if p]
     return "\n\n".join(parts)
 
 
@@ -165,6 +173,152 @@ def content_type(path: Path) -> str:
     if ext == ".pdf":
         return "application/pdf"
     return "application/octet-stream"
+
+
+def search_socket() -> str:
+    configured = os.environ.get("VAULT_SEARCH_SOCKET")
+    if configured:
+        return configured
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return str(Path(xdg) / "vault-search.sock")
+    return f"/tmp/vault-search-{os.getuid()}.sock"
+
+
+def run_vault_search(query: str, k: int = 4) -> str:
+    query = query.strip()
+    if not query:
+        return "query is empty"
+    k = max(1, min(int(k), 4))
+    binary = os.environ.get(
+        "VAULT_SEARCHD", str(Path.home() / ".local/bin/vault-searchd")
+    )
+    try:
+        done = subprocess.run(
+            [binary, "query", "--socket", search_socket(), "--k", str(k), query],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"vault_search failed: {exc}"
+    text = (done.stdout or done.stderr or "").strip()
+    if done.returncode != 0:
+        return text or f"vault_search exited {done.returncode}"
+    return text or "No matching notes."
+
+
+_tools_cache: list | None = None
+
+
+def tool_definitions() -> list:
+    global _tools_cache
+    if _tools_cache is not None:
+        return _tools_cache
+    host, port = _upstream_parts()
+    conn = HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request("GET", "/tools")
+        resp = conn.getresponse()
+        raw = resp.read()
+    except OSError:
+        return []
+    finally:
+        conn.close()
+    try:
+        listed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    _tools_cache = [
+        item["definition"]
+        for item in listed
+        if isinstance(item, dict) and item.get("definition")
+    ]
+    return _tools_cache
+
+
+def complete_with_tools(payload: dict, post, search, rounds: int = 3) -> dict:
+    """Run vault_search when the model asks, then continue until a final answer."""
+    messages = list(payload.get("messages") or [])
+    result: dict = {}
+    for _ in range(rounds):
+        body = dict(payload)
+        body["messages"] = messages
+        body["stream"] = False
+        result = post(body)
+        message = result["choices"][0]["message"]
+        calls = message.get("tool_calls") or []
+        if not calls:
+            if isinstance(message.get("content"), str):
+                message["content"] = ensure_source_links(message["content"])
+            return result
+        messages.append(message)
+        for call in calls:
+            function = call.get("function") or {}
+            name = function.get("name") or ""
+            raw_args = function.get("arguments") or "{}"
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+            else:
+                args = raw_args
+            if name == "vault_search":
+                text = search(str(args.get("query") or ""), args.get("k") or 4)
+            else:
+                text = f"Unknown tool: {name}"
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or "call",
+                    "content": text,
+                }
+            )
+    return result
+
+
+def post_chat(payload: dict) -> dict:
+    host, port = _upstream_parts()
+    raw = json.dumps(payload).encode("utf-8")
+    conn = HTTPConnection(host, port, timeout=600)
+    try:
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=raw,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(raw))},
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.status != 200:
+            raise OSError(f"upstream {resp.status}: {data[:200]!r}")
+    finally:
+        conn.close()
+    return json.loads(data)
+
+
+def as_sse(result: dict) -> bytes:
+    message = result["choices"][0]["message"]
+    chunks = [
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": message.get("content") or "",
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    lines = [f"data: {json.dumps(item)}\n\n" for item in chunks]
+    lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode("utf-8")
 
 
 def ensure_source_links(text: str) -> str:
@@ -258,6 +412,47 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         return True
 
+    def _chat(self, body: bytes) -> None:
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            self.send_error(400, "chat body is not JSON")
+            return
+        if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+            self.send_error(400, "chat body needs messages")
+            return
+        try:
+            note = load_note()
+        except OSError as exc:
+            self.send_error(502, f"system prompt unreadable: {exc}")
+            return
+        want_stream = bool(payload.get("stream"))
+        prompt = system_text(note, datetime.now(ZONE))
+        payload = inject_messages(payload, prompt)
+        payload["stream"] = False
+        if not payload.get("tools"):
+            tools = tool_definitions()
+            if tools:
+                payload["tools"] = tools
+                payload.setdefault("tool_choice", "auto")
+        try:
+            result = complete_with_tools(payload, post_chat, run_vault_search)
+        except (OSError, json.JSONDecodeError, KeyError, IndexError) as exc:
+            self.send_error(502, f"chat failed: {exc}")
+            return
+        if want_stream:
+            raw = as_sse(result)
+            content_type = "text/event-stream"
+        else:
+            raw = json.dumps(result).encode("utf-8")
+            content_type = "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_POST(self) -> None:
         self._proxy()
 
@@ -269,11 +464,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if self.command == "POST" and path in CHAT_PATHS:
-            try:
-                body = rewrite_chat(body, datetime.now(ZONE), load_note())
-            except OSError as exc:
-                self.send_error(502, f"system prompt unreadable: {exc}")
-                return
+            self._chat(body)
+            return
         host, port = _upstream_parts()
         headers = {
             key: value
@@ -342,6 +534,8 @@ def self_test() -> None:
     assert "Last week ≈ 2026-10-24 to 2026-10-30." in block
     assert "Last month = September 2026." in block
     assert "Last year = 2025." in block
+    assert "Daily/2026-10-30" in block
+    assert "call vault_search" in block
     january = date_block(datetime(2026, 1, 2, tzinfo=ZONE))
     assert "Last month = December 2025." in january
     note = strip_frontmatter("---\ntitle: x\n---\n\n# Hello\n\nRules.\n")
@@ -367,6 +561,55 @@ def self_test() -> None:
     assert "be brief" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "hi"}
     assert f"{PUBLIC_BASE}/vault/Daily/2026-10-31.md" in messages[0]["content"]
+
+    def fake_post(body: dict) -> dict:
+        queries = [m for m in body["messages"] if m.get("role") == "tool"]
+        if not queries:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "vault_search",
+                                        "arguments": '{"query":"Daily/2026-10-30","k":4}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Yesterday is in Daily/2026-10-30.md.",
+                    }
+                }
+            ]
+        }
+
+    seen = []
+
+    def fake_search(query: str, k: int) -> str:
+        seen.append((query, int(k)))
+        return "path: Daily/2026-10-30.md\nscore: 0.900\nworked on the proxy\n"
+
+    finished = complete_with_tools(
+        {"messages": [{"role": "user", "content": "What we did yesterday?"}]},
+        fake_post,
+        fake_search,
+    )
+    assert seen == [("Daily/2026-10-30", 4)]
+    assert "Daily/2026-10-30.md" in finished["choices"][0]["message"]["content"]
+    assert "/vault/Daily/2026-10-30.md" in finished["choices"][0]["message"]["content"]
     linked = ensure_source_links("See Notes/nitro5.md for the host.")
     assert f"{PUBLIC_BASE}/vault/Notes/nitro5.md" in linked
     assert ensure_source_links(linked) == linked
