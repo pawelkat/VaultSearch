@@ -106,8 +106,9 @@ def source_link_block() -> str:
     return (
         "Source links are required whenever you use vault_search.\n"
         f"Prefix each tool `path:` with {PUBLIC_BASE}{VAULT_URL_PREFIX}\n"
-        "Example: path Notes/nitro5.md becomes "
-        f"[nitro5]({PUBLIC_BASE}{VAULT_URL_PREFIX}Notes/nitro5.md)\n"
+        "Example: path Daily/2026-10-31.md becomes "
+        f"[2026-10-31]({PUBLIC_BASE}{VAULT_URL_PREFIX}Daily/2026-10-31.md)\n"
+        "Do not add a Notes/ prefix. The path value is already from the vault root.\n"
         "End the answer with a Sources section, one link per path. "
         "Never invent a path."
     )
@@ -118,12 +119,7 @@ def system_text(note: str, now: datetime) -> str:
     return "\n\n".join(parts)
 
 
-def resolve_vault_file(root: Path, url_path: str) -> Path | None:
-    """Map /vault/<rel> to a file inside root. None if unsafe or not a file."""
-    raw = unquote(url_path.split("?", 1)[0])
-    if not raw.startswith(VAULT_URL_PREFIX):
-        return None
-    rel = raw[len(VAULT_URL_PREFIX) :]
+def _file_inside(root: Path, rel: str) -> Path | None:
     if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/"):
         return None
     parts = Path(rel).parts
@@ -138,6 +134,25 @@ def resolve_vault_file(root: Path, url_path: str) -> Path | None:
     if not candidate.is_file():
         return None
     return candidate
+
+
+def resolve_vault_file(root: Path, url_path: str) -> Path | None:
+    """Map /vault/<rel> to a file inside root. None if unsafe or not a file.
+
+    Qwen sometimes prefixes Notes/ onto a path that already starts at the
+    vault root (Daily/…, System/…). Try the path as given, then without
+    that extra Notes/ segment.
+    """
+    raw = unquote(url_path.split("?", 1)[0])
+    if not raw.startswith(VAULT_URL_PREFIX):
+        return None
+    rel = raw[len(VAULT_URL_PREFIX) :]
+    found = _file_inside(root, rel)
+    if found is not None:
+        return found
+    if rel.startswith("Notes/"):
+        return _file_inside(root, rel[len("Notes/") :])
+    return None
 
 
 def content_type(path: Path) -> str:
@@ -351,7 +366,7 @@ def self_test() -> None:
     assert "2026-10-31" in messages[0]["content"]
     assert "be brief" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "hi"}
-    assert f"{PUBLIC_BASE}/vault/Notes/nitro5.md" in messages[0]["content"]
+    assert f"{PUBLIC_BASE}/vault/Daily/2026-10-31.md" in messages[0]["content"]
     linked = ensure_source_links("See Notes/nitro5.md for the host.")
     assert f"{PUBLIC_BASE}/vault/Notes/nitro5.md" in linked
     assert ensure_source_links(linked) == linked
@@ -363,8 +378,17 @@ def self_test() -> None:
         note.mkdir()
         (note / "A.md").write_text("hello", encoding="utf-8")
         outside = root.parent / "secret.md"
+        daily = root / "Daily"
+        daily.mkdir()
+        (daily / "2026-10-31.md").write_text("day", encoding="utf-8")
         found = resolve_vault_file(root, "/vault/Notes/A.md")
         assert found == (note / "A.md").resolve()
+        assert resolve_vault_file(root, "/vault/Notes/Daily/2026-10-31.md") == (
+            daily / "2026-10-31.md"
+        ).resolve()
+        assert resolve_vault_file(root, "/vault/Daily/2026-10-31.md") == (
+            daily / "2026-10-31.md"
+        ).resolve()
         assert resolve_vault_file(root, "/vault/Notes/../../secret.md") is None
         assert resolve_vault_file(root, "/vault/../secret.md") is None
         assert resolve_vault_file(root, "/health") is None
