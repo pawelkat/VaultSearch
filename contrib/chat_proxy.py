@@ -206,7 +206,24 @@ def run_vault_search(query: str, k: int = 4) -> str:
     text = (done.stdout or done.stderr or "").strip()
     if done.returncode != 0:
         return text or f"vault_search exited {done.returncode}"
+    note = daily_note_text(query)
+    if note:
+        text = (text + "\n\n" + note).strip() if text else note
     return text or "No matching notes."
+
+
+def daily_note_text(query: str) -> str:
+    """The search hit for a daily note is often only the title. Read the file."""
+    match = re.fullmatch(r"Daily/(\d{4}-\d{2}-\d{2})(?:\.md)?", query.strip())
+    if not match:
+        return ""
+    path = _file_inside(VAULT_ROOT, f"Daily/{match.group(1)}.md")
+    if path is None:
+        return ""
+    body = path.read_text(encoding="utf-8").strip()
+    if len(body) > 4000:
+        body = body[:4000].rstrip() + "\n…"
+    return f"Full note Daily/{match.group(1)}.md:\n{body}"
 
 
 _tools_cache: list | None = None
