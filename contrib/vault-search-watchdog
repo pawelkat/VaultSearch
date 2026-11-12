@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# Idempotent start/supervise for the EmbeddingGemma embedder and vault-searchd.
+#
+# The Grok Bot shared box does not run systemd as PID 1 (tini/pod-daemon does),
+# has no working systemctl --user, and has no cron. This script is the
+# autostart path there. On hosts with systemd --user, prefer the units in
+# this directory instead.
+#
+# Commands:
+#   vault-search-watchdog once          start anything that is down, then exit
+#   vault-search-watchdog loop          supervise in the foreground
+#   vault-search-watchdog detach-loop   start the loop in the background if needed
+#   vault-search-watchdog status        print health (does not start anything)
+#   vault-search-watchdog install-hook  hook start-sand-box so the loop starts at box boot
+#   vault-search-watchdog uninstall-hook
+#
+# Environment (optional):
+#   VAULT_SEARCH_WATCHDOG_INTERVAL  loop sleep seconds (default 15)
+#   VAULT_SEARCH_RUNTIME_DIR        default /tmp/xdg-runtime-box-vault (keep this
+#                                   so the vault-search skill glob still matches)
+set -euo pipefail
+
+PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export PATH
+
+STATE_DIR="${HOME}/.local/state/vault-search"
+SHARE_DIR="${HOME}/.local/share/vault-search"
+RUNTIME_DIR="${VAULT_SEARCH_RUNTIME_DIR:-/tmp/xdg-runtime-box-vault}"
+SOCK="${RUNTIME_DIR}/vault-search.sock"
+EMBED_URL="http://127.0.0.1:8081"
+EMBED_HEALTH="${EMBED_URL}/health"
+EMBED_PY_VENV="${SHARE_DIR}/venv/bin/python"
+SEARCHD="${HOME}/.local/bin/vault-searchd"
+INDEX="${SHARE_DIR}/index.db"
+SYNC_CONFIG="${HOME}/.config/vault-rclone/config.env"
+INTERVAL="${VAULT_SEARCH_WATCHDOG_INTERVAL:-15}"
+EMBED_WAIT_SECS="${VAULT_SEARCH_EMBED_WAIT_SECS:-180}"
+HOOK_TARGET="/usr/local/bin/start-sand-box"
+
+log() {
+	mkdir -p "${STATE_DIR}"
+	printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"${STATE_DIR}/watchdog.log"
+	if [ -t 2 ]; then
+		printf '%s\n' "$*" >&2
+	fi
+}
+
+is_pid_alive() {
+	local pid="${1:-}"
+	[ -n "${pid}" ] && [ "${pid}" -gt 1 ] 2>/dev/null && kill -0 "${pid}" 2>/dev/null
+}
+
+embed_script() {
+	if [ -f /workspace/src/VaultSearch/contrib/embed_server.py ]; then
+		printf '%s\n' /workspace/src/VaultSearch/contrib/embed_server.py
+	elif [ -f "${SHARE_DIR}/embed_server.py" ]; then
+		printf '%s\n' "${SHARE_DIR}/embed_server.py"
+	else
+		return 1
+	fi
+}
+
+embed_healthy() {
+	local code
+	code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 "${EMBED_HEALTH}" 2>/dev/null || true)"
+	if [ "${code}" = "200" ]; then
+		return 0
+	fi
+	# Fallback: any HTTP response means the server accepted a connection
+	# (older embed_server.py has no /health; GET /v1/embeddings returns 501).
+	code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 "${EMBED_URL}/v1/embeddings" 2>/dev/null || true)"
+	[ -n "${code}" ] && [ "${code}" != "000" ]
+}
+
+searchd_healthy() {
+	[ -S "${SOCK}" ] && "${SEARCHD}" status --socket "${SOCK}" >/dev/null 2>&1
+}
+
+embed_pids() {
+	ps -eo pid=,args= | awk 'index($0, "embed_server.py") && !/awk / { print $1 }'
+}
+
+wait_for_embed() {
+	local i
+	for i in $(seq 1 "${EMBED_WAIT_SECS}"); do
+		if embed_healthy; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+start_embedder() {
+	local script py
+	if embed_healthy; then
+		return 0
+	fi
+	if [ -n "$(embed_pids)" ]; then
+		log "embedder process present but not healthy yet; waiting"
+		wait_for_embed
+		return
+	fi
+	script="$(embed_script)" || {
+		log "embedder script missing (need repo contrib/embed_server.py or ${SHARE_DIR}/embed_server.py)"
+		return 1
+	}
+	if [ -x "${EMBED_PY_VENV}" ]; then
+		py="${EMBED_PY_VENV}"
+	else
+		log "embedder venv python missing: ${EMBED_PY_VENV}"
+		return 1
+	fi
+	mkdir -p "${STATE_DIR}"
+	log "starting embedder: ${py} -u ${script}"
+	# setsid so a later shell exit does not SIGHUP the model server.
+	setsid nohup "${py}" -u "${script}" >>"${STATE_DIR}/embed.log" 2>&1 8>&- 9>&- &
+	echo $! >"${STATE_DIR}/embed.pid"
+	if ! wait_for_embed; then
+		log "embedder did not become healthy within ${EMBED_WAIT_SECS}s"
+		return 1
+	fi
+	log "embedder healthy on ${EMBED_URL}"
+}
+
+vault_root() {
+	local vault="${HOME}/Obsidian/Vault"
+	if [ -f "${SYNC_CONFIG}" ]; then
+		# shellcheck disable=SC1090
+		vault="$(. "${SYNC_CONFIG}" >/dev/null 2>&1; printf '%s' "${VAULT_LOCAL:-}")"
+		[ -n "${vault}" ] || vault="${HOME}/Obsidian/Vault"
+	fi
+	printf '%s\n' "${vault}"
+}
+
+start_searchd() {
+	local vault
+	if searchd_healthy; then
+		return 0
+	fi
+	if ! command -v vault-searchd >/dev/null 2>&1 && [ ! -x "${SEARCHD}" ]; then
+		log "vault-searchd missing at ${SEARCHD}"
+		return 1
+	fi
+	if ! embed_healthy; then
+		log "waiting for embedder before starting vault-searchd"
+		wait_for_embed || {
+			log "not starting vault-searchd: embedder is not healthy"
+			return 1
+		}
+	fi
+	vault="$(vault_root)"
+	mkdir -p "${STATE_DIR}" "${SHARE_DIR}" "${RUNTIME_DIR}"
+	chmod 700 "${RUNTIME_DIR}" || true
+	# Intentionally not inheriting the agent's XDG_RUNTIME_DIR.
+	export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+	log "starting vault-searchd (socket ${SOCK})"
+	if [ -f "${SYNC_CONFIG}" ]; then
+		setsid nohup "${SEARCHD}" serve \
+			--vault "${vault}" \
+			--index "${INDEX}" \
+			--embed-url "${EMBED_URL}/v1/embeddings" \
+			--dim 768 \
+			--sync-interval 120 \
+			--sync-config "${SYNC_CONFIG}" \
+			>>"${STATE_DIR}/searchd.log" 2>&1 8>&- 9>&- &
+	else
+		setsid nohup "${SEARCHD}" serve \
+			--vault "${vault}" \
+			--index "${INDEX}" \
+			--embed-url "${EMBED_URL}/v1/embeddings" \
+			--dim 768 \
+			>>"${STATE_DIR}/searchd.log" 2>&1 8>&- 9>&- &
+	fi
+	echo $! >"${STATE_DIR}/searchd.pid"
+	local i
+	for i in $(seq 1 20); do
+		if searchd_healthy; then
+			log "vault-searchd healthy at ${SOCK}"
+			return 0
+		fi
+		sleep 0.25
+	done
+	log "vault-searchd did not become healthy"
+	return 1
+}
+
+cmd_once() {
+	mkdir -p "${STATE_DIR}"
+	exec 8>"${STATE_DIR}/watchdog-once.lock"
+	if ! flock -w 120 8; then
+		log "once: could not acquire lock"
+		return 1
+	fi
+	start_embedder
+	start_searchd
+}
+
+cmd_status() {
+	local embed="down" daemon="down" loop="down" loop_pid=""
+	if embed_healthy; then
+		embed="up"
+	fi
+	if searchd_healthy; then
+		daemon="up"
+	fi
+	if [ -f "${STATE_DIR}/watchdog-loop.pid" ]; then
+		loop_pid="$(tr -dc '0-9' <"${STATE_DIR}/watchdog-loop.pid" || true)"
+		if is_pid_alive "${loop_pid}"; then
+			loop="up (pid ${loop_pid})"
+		fi
+	fi
+	printf 'embedder: %s (%s)\n' "${embed}" "${EMBED_URL}"
+	printf 'searchd:  %s (socket %s)\n' "${daemon}" "${SOCK}"
+	printf 'loop:     %s\n' "${loop}"
+	if searchd_healthy; then
+		"${SEARCHD}" status --socket "${SOCK}" || true
+	fi
+	# 0 only when the query path is usable.
+	[ "${embed}" = "up" ] && [ "${daemon}" = "up" ]
+}
+
+loop_running() {
+	local pid=""
+	[ -f "${STATE_DIR}/watchdog-loop.pid" ] || return 1
+	pid="$(tr -dc '0-9' <"${STATE_DIR}/watchdog-loop.pid" || true)"
+	is_pid_alive "${pid}"
+}
+
+cmd_loop() {
+	mkdir -p "${STATE_DIR}"
+	exec 9>"${STATE_DIR}/watchdog-loop.lock"
+	if ! flock -n 9; then
+		log "loop already running"
+		exit 0
+	fi
+	echo $$ >"${STATE_DIR}/watchdog-loop.pid"
+	log "watchdog loop started (interval ${INTERVAL}s, pid $$)"
+	while true; do
+		cmd_once || true
+		# Close lock fds so an external sleep does not inherit the loop flock.
+		sleep "${INTERVAL}" 8>&- 9>&-
+	done
+}
+
+cmd_detach_loop() {
+	mkdir -p "${STATE_DIR}"
+	if loop_running; then
+		log "watchdog loop already running"
+		exit 0
+	fi
+	# New session, no controlling tty. The child takes watchdog-loop.lock.
+	setsid "$0" loop </dev/null >>"${STATE_DIR}/watchdog.log" 2>&1 &
+	local pid=$!
+	echo "${pid}" >"${STATE_DIR}/watchdog-loop.pid"
+	local i
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		if loop_running; then
+			log "watchdog loop detached (pid $(tr -dc '0-9' <"${STATE_DIR}/watchdog-loop.pid"))"
+			exit 0
+		fi
+		# Child may have already rewritten the pid file to its own $$ .
+		if is_pid_alive "${pid}"; then
+			sleep 0.2
+			continue
+		fi
+		break
+	done
+	if loop_running; then
+		log "watchdog loop detached"
+		exit 0
+	fi
+	log "watchdog loop failed to stay running"
+	exit 1
+}
+
+install_self() {
+	mkdir -p "${HOME}/.local/bin"
+	local self
+	self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+	if [ "${self}" != "${HOME}/.local/bin/vault-search-watchdog" ]; then
+		cp -f "${self}" "${HOME}/.local/bin/vault-search-watchdog"
+		chmod 0755 "${HOME}/.local/bin/vault-search-watchdog"
+	fi
+}
+
+cmd_install_hook() {
+	install_self
+	if [ ! -f "${HOOK_TARGET}" ]; then
+		log "hook target missing: ${HOOK_TARGET}"
+		return 1
+	fi
+	if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+		log "install-hook needs passwordless sudo to patch ${HOOK_TARGET}"
+		return 1
+	fi
+	local backup tmp patched
+	backup="${SHARE_DIR}/start-sand-box.pre-hook"
+	tmp="$(mktemp)"
+	patched="$(mktemp)"
+	mkdir -p "${SHARE_DIR}"
+	# Keep the first backup only, so later re-installs do not overwrite the original.
+	if [ ! -f "${backup}" ]; then
+		sudo -n cp -a "${HOOK_TARGET}" "${backup}"
+		sudo -n chown "$(id -u):$(id -g)" "${backup}"
+	fi
+	# Read as box (the boot script is world-readable); do not sudo-cp into /tmp
+	# or the tempfile is root-owned and chmod fails.
+	cp -a "${HOOK_TARGET}" "${tmp}"
+	chmod u+w "${tmp}"
+	python3 - "${tmp}" "${patched}" <<'PY'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1]).read_text()
+start = "# >>> vault-search-watchdog hook >>>\n"
+end = "# <<< vault-search-watchdog hook <<<\n"
+body = """# >>> vault-search-watchdog hook >>>
+# Start embedder + vault-searchd on box boot. systemd is not PID 1 on this image.
+if [ -x /home/box/.local/bin/vault-search-watchdog ]; then
+	if [ "${#AS_BOX[@]}" -gt 0 ] 2>/dev/null; then
+		"${AS_BOX[@]}" /home/box/.local/bin/vault-search-watchdog detach-loop >>/tmp/vault-search-watchdog-boot.log 2>&1 || true
+	else
+		/usr/bin/runuser -u box -- /home/box/.local/bin/vault-search-watchdog detach-loop >>/tmp/vault-search-watchdog-boot.log 2>&1 || true
+	fi
+fi
+# <<< vault-search-watchdog hook <<<
+"""
+if start in src and end in src:
+    pre, rest = src.split(start, 1)
+    _, post = rest.split(end, 1)
+    # body already includes both markers and a trailing newline
+    out = pre + body + (post[1:] if post.startswith("\n") else post)
+else:
+    needle = "\nstart_desktop\nrun_box_doctor\n"
+    if needle not in src:
+        sys.stderr.write("could not find start_desktop/run_box_doctor call site\n")
+        sys.exit(2)
+    out = src.replace(needle, "\nstart_desktop\n" + body + "run_box_doctor\n", 1)
+pathlib.Path(sys.argv[2]).write_text(out)
+PY
+	# Validate before replacing the live boot script.
+	if ! bash -n "${patched}"; then
+		log "patched start-sand-box failed bash -n; aborting"
+		rm -f "${tmp}" "${patched}"
+		return 1
+	fi
+	sudo -n cp -f "${patched}" "${HOOK_TARGET}"
+	sudo -n chmod 0755 "${HOOK_TARGET}"
+	rm -f "${tmp}" "${patched}"
+	if ! grep -q 'vault-search-watchdog hook' "${HOOK_TARGET}"; then
+		log "hook was not visible in ${HOOK_TARGET} after install"
+		return 1
+	fi
+	if ! bash -n "${HOOK_TARGET}"; then
+		log "live start-sand-box failed bash -n after install; restore ${backup}"
+		return 1
+	fi
+	log "installed boot hook in ${HOOK_TARGET} (backup ${backup})"
+}
+
+cmd_uninstall_hook() {
+	if [ ! -f "${HOOK_TARGET}" ]; then
+		return 0
+	fi
+	if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+		log "uninstall-hook needs passwordless sudo"
+		return 1
+	fi
+	if ! grep -q 'vault-search-watchdog hook' "${HOOK_TARGET}"; then
+		log "no hook present in ${HOOK_TARGET}"
+		return 0
+	fi
+	local tmp patched
+	tmp="$(mktemp)"
+	patched="$(mktemp)"
+	cp -a "${HOOK_TARGET}" "${tmp}"
+	chmod u+w "${tmp}"
+	python3 - "${tmp}" "${patched}" <<'PY'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1]).read_text()
+start = "# >>> vault-search-watchdog hook >>>\n"
+end = "# <<< vault-search-watchdog hook <<<\n"
+if start not in src or end not in src:
+    pathlib.Path(sys.argv[2]).write_text(src)
+    sys.exit(0)
+pre, rest = src.split(start, 1)
+_, post = rest.split(end, 1)
+if post.startswith("\n"):
+    post = post[1:]
+pathlib.Path(sys.argv[2]).write_text(pre + post)
+PY
+	if ! bash -n "${patched}"; then
+		log "unhooked start-sand-box failed bash -n; aborting"
+		rm -f "${tmp}" "${patched}"
+		return 1
+	fi
+	sudo -n cp -f "${patched}" "${HOOK_TARGET}"
+	sudo -n chmod 0755 "${HOOK_TARGET}"
+	rm -f "${tmp}" "${patched}"
+	log "removed boot hook from ${HOOK_TARGET}"
+}
+
+usage() {
+	cat <<'EOF'
+Usage: vault-search-watchdog <once|loop|detach-loop|status|install-hook|uninstall-hook>
+EOF
+}
+
+main() {
+	local cmd="${1:-once}"
+	case "${cmd}" in
+	once | --once) cmd_once ;;
+	loop | --loop) cmd_loop ;;
+	detach-loop | --detach-loop) cmd_detach_loop ;;
+	status | --status) cmd_status ;;
+	install-hook | --install-hook) cmd_install_hook ;;
+	uninstall-hook | --uninstall-hook) cmd_uninstall_hook ;;
+	-h | --help) usage ;;
+	*)
+		usage >&2
+		exit 2
+		;;
+	esac
+}
+
+main "$@"
