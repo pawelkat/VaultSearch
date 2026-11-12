@@ -5,6 +5,8 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now vault-embed.service vault-searchd.service
 # The first start downloads the model; give it a few minutes.
+# These units need systemd --user (and lingering). The Grok Bot shared box
+# does not run systemd as PID 1; use contrib/vault-search-watchdog there.
 [Unit]
 Description=Vault search embedder (EmbeddingGemma, loopback only)
 After=default.target

@@ -61,6 +61,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def do_GET(self) -> None:
+        if self.path.rstrip("/") != "/health":
+            self.send_error(404)
+            return
+        raw = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def log_message(self, fmt: str, *args: object) -> None:
         return
 

@@ -3,6 +3,8 @@
 # not fail when the embedder is down; it logs, keeps serving, and retries the
 # reindex on its 60 s scan, so Wants= (not Requires=) is enough.
 # Not installed or enabled by the build or CI.
+# Needs systemd --user. On the Grok Bot shared box use
+# contrib/vault-search-watchdog instead (see README "Autostart").
 [Unit]
 Description=Vault search index (and optional vault sync)
 Wants=vault-embed.service

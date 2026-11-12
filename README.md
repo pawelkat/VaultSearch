@@ -162,3 +162,18 @@ Nitro runs it this way (since 2026-10-31). `vault-sync.timer`, `vault-sync.servi
 `vault-searchd status` prints the socket, vault, index counts (`notes`, `chunks`, `dim`, indexing now), the last index error, whether the embedder accepts connections, and the sync health: enabled and interval, remote and local, runs and failures, last sync time (UTC) and exit code, last ok sync, last sync error, and the reindex result after the last good sync, plus the vault watch (on / FAILED / off, debounce, events, watch-triggered reindexes). The same fields are in the `{"op":"status"}` reply as optional JSON fields (`vault`, `embed_ok`, `embed_url`, `sync{…}`, `watch{…}`), so older clients keep working and older daemons simply omit them.
 
 User systemd units (not installed or enabled by the build): `contrib/vault-embed.service` and `contrib/vault-searchd.service`. The searchd unit ships with `--sync-interval 120` commented out so copying it cannot start a second sync owner. Uncomment that line, and stop the other owner, on a desktop that should sync the way Nitro does.
+
+## Autostart (Grok Bot box)
+
+The shared Grok Bot box does not run systemd as PID 1 (`tini` / `pod-daemon` does), `systemctl --user` has no bus, and `cron` is not installed. XFCE autostart also does not run: `start-desktop.sh` starts `xfwm4` and `xfce4-panel` directly, not `xfce4-session`. Use `contrib/vault-search-watchdog` there.
+
+```bash
+install -Dm755 contrib/vault-search-watchdog ~/.local/bin/vault-search-watchdog
+vault-search-watchdog install-hook   # patches /usr/local/bin/start-sand-box (sudo); needs re-run after "Update Bot's Computer"
+vault-search-watchdog detach-loop    # start the supervisor now
+vault-search-watchdog status
+```
+
+The watchdog starts the embedder if `127.0.0.1:8081/health` is down (venv `~/.local/share/vault-search/venv`, script `contrib/embed_server.py`) and starts `vault-searchd serve` if `/tmp/xdg-runtime-box-vault/vault-search.sock` does not answer `status`. It waits for the embedder before `serve`. A flock lock prevents duplicate instances. Logs and pid files go under `~/.local/state/vault-search/`. The loop checks about every 15 seconds (`VAULT_SEARCH_WATCHDOG_INTERVAL`).
+
+`install-hook` inserts a marked block into `start-sand-box` just after the `start_desktop` call so the loop is detached on every box boot, as `box`. Image updates replace `/usr/local/bin/start-sand-box`; run `install-hook` again after that. `uninstall-hook` removes the block. A copy of the pre-hook script is kept at `~/.local/share/vault-search/start-sand-box.pre-hook`.
