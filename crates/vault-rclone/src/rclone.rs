@@ -187,9 +187,12 @@ pub struct BisyncOpts<'a> {
 /// their names if the bash script and this binary take turns.
 ///
 /// Always passes `--max-delete`, newer-wins conflict resolution with a
-/// `*.conflict-…` loser kept, `--fast-list`, and `-v` so the run summary
-/// lands on stderr. `--resync` adds `--resync-mode newer`, so a resync also
-/// keeps the newer copy instead of rclone's default "Path1 always wins".
+/// `*.conflict-…` loser kept, `--fast-list`, `-v` so the run summary
+/// lands on stderr, and `--disable-http2`. rclone can hang indefinitely on
+/// HTTP/2 through some proxies (idle connections, no listing progress); the
+/// Grok Bot box egress tunnel did this on a `--resync`. `--resync` adds
+/// `--resync-mode newer`, so a resync also keeps the newer copy instead of
+/// rclone's default "Path1 always wins".
 pub fn bisync_args(cfg: &Config, local: &Path, opts: &BisyncOpts<'_>) -> Vec<String> {
     let max_delete = cfg.max_delete.to_string();
     let mut v = with_globals(
@@ -208,6 +211,7 @@ pub fn bisync_args(cfg: &Config, local: &Path, opts: &BisyncOpts<'_>) -> Vec<Str
             &cfg.conflict_suffix,
             "--fast-list",
             "-v",
+            "--disable-http2",
         ],
     );
     if let Some(f) = opts.filters_file {
@@ -504,6 +508,7 @@ mod tests {
             Some(".conflict-{DateOnly}-")
         );
         assert!(sync.contains(&"--fast-list".to_string()));
+        assert!(sync.contains(&"--disable-http2".to_string()));
         assert!(!sync.contains(&"--resync".to_string()));
         assert!(!sync.contains(&"--resync-mode".to_string()));
         assert!(!sync.contains(&"--dry-run".to_string()));
@@ -524,6 +529,7 @@ mod tests {
         assert_eq!(flag_value(&re, "--filters-file"), Some("/h/filters.txt"));
         assert_eq!(flag_value(&re, "--max-delete"), Some("25"));
         assert!(re.contains(&"--dry-run".to_string()));
+        assert!(re.contains(&"--disable-http2".to_string()));
 
         c.rclone_config = Some(PathBuf::from("/h/rclone.conf"));
         let g = bisync_args(&c, local, &BisyncOpts::default());

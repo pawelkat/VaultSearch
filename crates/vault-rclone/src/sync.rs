@@ -334,10 +334,12 @@ fn run_bisync(
                 writeln!(out, "{name}: FAILED (rclone exit {code}): {err}")?;
                 log.line(&format!("rclone error: {err}"), out)?;
                 if code == 7 {
-                    writeln!(
-                        out,
-                        "{name}: rclone needs a resync; check the vault first, then `vault-rclone resync --dry-run`"
-                    )?;
+                    // Incremental sync cannot create the baseline. A dry-run
+                    // resync writes only *.lst-dry and leaves the next sync
+                    // at exit 7; the real `resync` is required after it.
+                    let hint = "rclone exit 7: no bisync baseline (or a critical error). Incremental sync cannot recover. Check both sides, then run `vault-rclone resync --dry-run` and, if that looks right, `vault-rclone resync`.";
+                    writeln!(out, "{name}: {hint}")?;
+                    log.line(hint, out)?;
                 }
             }
             code
@@ -612,10 +614,14 @@ mod tests {
         let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, 7);
         assert!(s.contains("FAILED (rclone exit 7)"), "{s}");
+        assert!(s.contains("no bisync baseline"), "{s}");
         assert!(s.contains("resync --dry-run"), "{s}");
+        assert!(s.contains("`vault-rclone resync`"), "{s}");
         let log = read_log(&host);
         assert!(log.contains("sync start"), "{log}");
         assert!(log.contains("Path1:    2 changes"), "{log}");
+        assert!(log.contains("no bisync baseline"), "{log}");
+        assert!(log.contains("vault-rclone resync"), "{log}");
         assert!(log.contains("end exit=7"), "{log}");
         assert_no_secrets(&s);
         assert_no_secrets(&log);
