@@ -15,8 +15,9 @@
 //! exit code: the files are already synced.
 //!
 //! Each run appends start, guard results, a short summary, and the exit code
-//! to `<state>/vault-rclone/sync.log`. No tokens, no rclone.conf contents,
-//! and no per-file lines go into that log.
+//! to `SYNC_LOG` (default `~/.local/share/vault-rclone/logs/sync.log`). The
+//! file is rotated to `sync.log.1` when it exceeds `SYNC_LOG_MAX_BYTES`.
+//! No tokens, no rclone.conf contents, and no per-file lines go into that log.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -28,11 +29,35 @@ use crate::error::Error;
 use crate::rclone::{self, BisyncOpts, CommandRunner, RunOutput};
 use crate::reindex::{self, Reindexer};
 
-/// `<state_dir>/vault-rclone/sync.log`
-pub fn log_path(host: &Host) -> Option<PathBuf> {
-    host.state_dir
-        .as_ref()
-        .map(|d| d.join("vault-rclone").join("sync.log"))
+/// Configured run-log path, if logging is enabled.
+pub fn log_path(cfg: &Config) -> Option<PathBuf> {
+    cfg.sync_log.clone()
+}
+
+/// If `path` is larger than `max_bytes`, move it aside to `*.1` (one backup).
+/// `max_bytes == 0` disables rotation. Missing files are ignored.
+pub fn rotate_if_large(path: &Path, max_bytes: u64) -> io::Result<()> {
+    if max_bytes == 0 {
+        return Ok(());
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.len() <= max_bytes {
+        return Ok(());
+    }
+    let rotated = {
+        let mut name = path
+            .file_name()
+            .map(std::ffi::OsString::from)
+            .unwrap_or_else(|| "sync.log".into());
+        name.push(".1");
+        path.with_file_name(name)
+    };
+    let _ = std::fs::remove_file(&rotated);
+    std::fs::rename(path, rotated)
 }
 
 /// Append-only run log. Write errors are reported once and then ignored, so
@@ -44,9 +69,12 @@ struct RunLog {
 }
 
 impl RunLog {
-    fn new(host: &Host, run: &'static str) -> Self {
+    fn new(cfg: &Config, run: &'static str) -> Self {
+        if let Some(path) = &cfg.sync_log {
+            let _ = rotate_if_large(path, cfg.sync_log_max_bytes);
+        }
         RunLog {
-            path: log_path(host),
+            path: log_path(cfg),
             run,
             failed: false,
         }
@@ -227,7 +255,7 @@ fn run_bisync(
     out: &mut dyn Write,
 ) -> io::Result<i32> {
     let name = if resync { "resync" } else { "sync" };
-    let mut log = RunLog::new(host, name);
+    let mut log = RunLog::new(cfg, name);
     let fail = |log: &mut RunLog, out: &mut dyn Write, msg: String| -> io::Result<i32> {
         writeln!(out, "{name}: {msg}")?;
         log.line(&format!("refused: {msg}"), out)?;
@@ -368,7 +396,7 @@ fn run_bisync(
         log.line(&msg, out)?;
     }
     log.line(&format!("end exit={code}"), out)?;
-    if let Some(p) = log_path(host) {
+    if let Some(p) = log_path(cfg) {
         writeln!(out, "{name}: log {}", p.display())?;
     }
     Ok(code)
@@ -511,8 +539,11 @@ mod tests {
         (code, String::from_utf8(buf).unwrap())
     }
 
-    fn read_log(host: &Host) -> String {
-        std::fs::read_to_string(log_path(host).unwrap()).unwrap_or_default()
+    fn read_log(cfg: &Config) -> String {
+        match log_path(cfg) {
+            Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
+            None => String::new(),
+        }
     }
 
     fn assert_no_secrets(s: &str) {
@@ -570,8 +601,8 @@ mod tests {
         assert!(b[0].windows(2).any(|w| w == ["--resync-mode", "newer"]));
         assert!(b[0].contains(&"--dry-run".to_string()));
         assert!(b[0].windows(2).any(|w| w == ["--max-delete", "50"]));
-        assert!(read_log(&host).contains("resync start remote=gdrive:Vault"));
-        assert!(read_log(&host).contains(" dry-run"));
+        assert!(read_log(&cfg).contains("resync start remote=gdrive:Vault"));
+        assert!(read_log(&cfg).contains(" dry-run"));
     }
 
     #[test]
@@ -584,7 +615,7 @@ mod tests {
             assert!(s.contains("has 2 files, below MIN_FILES=3"), "{s}");
         }
         assert!(fake.calls.borrow().is_empty());
-        let log = read_log(&host);
+        let log = read_log(&cfg);
         assert!(log.contains("refused: local"), "{log}");
         assert!(log.contains("end exit=1"), "{log}");
     }
@@ -634,7 +665,7 @@ mod tests {
         assert!(s.contains("no bisync baseline"), "{s}");
         assert!(s.contains("resync --dry-run"), "{s}");
         assert!(s.contains("`vault-rclone resync`"), "{s}");
-        let log = read_log(&host);
+        let log = read_log(&cfg);
         assert!(log.contains("sync start"), "{log}");
         assert!(log.contains("Path1:    2 changes"), "{log}");
         assert!(log.contains("no bisync baseline"), "{log}");
@@ -654,7 +685,7 @@ mod tests {
             .into();
         let (code, _s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_OK);
-        let log = read_log(&host);
+        let log = read_log(&cfg);
         let lines: Vec<&str> = log.lines().collect();
         assert!(
             lines[0].contains(" sync start remote=gdrive:Vault"),
@@ -667,7 +698,7 @@ mod tests {
         assert!(!log.contains("diary.md"), "{log}");
         // Appends across runs.
         run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
-        assert_eq!(read_log(&host).matches("sync start").count(), 2);
+        assert_eq!(read_log(&cfg).matches("sync start").count(), 2);
     }
 
     #[test]
@@ -741,13 +772,34 @@ mod tests {
     }
 
     #[test]
-    fn no_state_dir_means_no_log_but_sync_still_runs() {
-        let (_d, mut host, cfg) = setup(3);
-        host.state_dir = None;
+    fn no_sync_log_means_no_log_but_sync_still_runs() {
+        let (_d, host, mut cfg) = setup(3);
+        cfg.sync_log = None;
         let fake = Fake::new();
         let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, EXIT_OK, "{s}");
         assert!(!s.contains("log "), "{s}");
+    }
+
+    #[test]
+    fn rotate_if_large_keeps_one_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("sync.log");
+        std::fs::write(&log, "old-log-contents-xxxxxxxx").unwrap();
+        rotate_if_large(&log, 8).unwrap();
+        assert!(!log.exists());
+        let rotated = dir.path().join("sync.log.1");
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "old-log-contents-xxxxxxxx"
+        );
+        std::fs::write(&log, "tiny").unwrap();
+        rotate_if_large(&log, 8).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "tiny");
+        // under the limit: backup left from the previous rotate
+        assert!(rotated.exists());
+        rotate_if_large(&log, 0).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "tiny");
     }
 
     #[test]
@@ -773,7 +825,7 @@ mod tests {
             s.contains("sync: reindex: ok (notes=412 chunks=3001)"),
             "{s}"
         );
-        let log = read_log(&host);
+        let log = read_log(&cfg);
         let lines: Vec<&str> = log.lines().collect();
         let n = lines.len();
         assert!(
@@ -810,7 +862,7 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{s2}");
         assert_eq!(daemon.count(), 0);
         assert!(!s.contains("reindex") && !s2.contains("reindex"), "{s}{s2}");
-        assert!(!read_log(&host).contains("reindex"));
+        assert!(!read_log(&cfg).contains("reindex"));
     }
 
     #[test]
@@ -825,7 +877,7 @@ mod tests {
             ),
             "{s}"
         );
-        let log = read_log(&host);
+        let log = read_log(&cfg);
         assert!(
             log.contains("reindex: skipped (vault-searchd not listening"),
             "{log}"
@@ -848,7 +900,7 @@ mod tests {
             s.contains("sync: reindex: FAILED (embed: http://127.0.0.1:8081 connection refused)"),
             "{s}"
         );
-        assert!(read_log(&host).contains("reindex: FAILED (embed:"));
+        assert!(read_log(&cfg).contains("reindex: FAILED (embed:"));
 
         let daemon = FakeDaemon::answering(Err(ReindexError::Failed(
             "no reply within 1800s (raise VAULT_REINDEX_TIMEOUT_SECS)".into(),

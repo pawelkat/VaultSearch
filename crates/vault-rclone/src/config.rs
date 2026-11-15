@@ -40,6 +40,23 @@ pub fn default_bisync_workdir(home: Option<&Path>) -> PathBuf {
         .join(DEFAULT_BISYNC_WORKDIR_REL)
 }
 
+/// Relative path under `$HOME` for the default bisync run log.
+///
+/// The previous default, `~/.local/state/vault-rclone/sync.log`, sits in a
+/// tree the Grok Bot box store ignores (`/.local/state/`). `~/.local/share/`
+/// is persisted, so the log lives next to the bisync workdir.
+pub const DEFAULT_SYNC_LOG_REL: &str = ".local/share/vault-rclone/logs/sync.log";
+
+/// Rotate `sync.log` once it exceeds this many bytes (keep one `sync.log.1`).
+pub const DEFAULT_SYNC_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// `$HOME/.local/share/vault-rclone/logs/sync.log`, or the same relative
+/// path when `HOME` is unknown (tests).
+pub fn default_sync_log(home: Option<&Path>) -> PathBuf {
+    home.unwrap_or_else(|| Path::new("."))
+        .join(DEFAULT_SYNC_LOG_REL)
+}
+
 /// Keys this crate reads. Anything else in a config file is ignored and never printed.
 pub const KNOWN_KEYS: &[&str] = &[
     "VAULT_LOCAL",
@@ -54,6 +71,8 @@ pub const KNOWN_KEYS: &[&str] = &[
     "VAULT_REINDEX",
     "VAULT_REINDEX_TIMEOUT_SECS",
     "BISYNC_WORKDIR",
+    "SYNC_LOG",
+    "SYNC_LOG_MAX_BYTES",
 ];
 
 /// Resolved settings. Holds paths only, never credentials.
@@ -82,6 +101,12 @@ pub struct Config {
     /// `--workdir` for bisync listings and lock files. Default
     /// `~/.local/share/vault-rclone/bisync` (see [`default_bisync_workdir`]).
     pub bisync_workdir: PathBuf,
+    /// Append-only run log (`sync.log`). `None` disables it (`SYNC_LOG` set
+    /// to `off`, `false`, `no`, `none`, or `-`). Default
+    /// `~/.local/share/vault-rclone/logs/sync.log`.
+    pub sync_log: Option<PathBuf>,
+    /// Rotate `sync_log` to `*.1` when it exceeds this many bytes. `0` disables.
+    pub sync_log_max_bytes: u64,
     /// Config files that existed and were read, lowest precedence first.
     pub files_read: Vec<PathBuf>,
 }
@@ -156,6 +181,16 @@ impl Config {
             )?,
             bisync_workdir: path_of("BISYNC_WORKDIR")
                 .unwrap_or_else(|| default_bisync_workdir(home)),
+            sync_log: match get("SYNC_LOG") {
+                Some(v) if log_disabled(v) => None,
+                Some(_) => path_of("SYNC_LOG"),
+                None => Some(default_sync_log(home)),
+            },
+            sync_log_max_bytes: number(
+                get("SYNC_LOG_MAX_BYTES"),
+                "SYNC_LOG_MAX_BYTES",
+                DEFAULT_SYNC_LOG_MAX_BYTES,
+            )?,
             files_read,
         })
     }
@@ -237,6 +272,13 @@ pub fn expand_home(v: &str, home: Option<&Path>) -> PathBuf {
         }
     }
     PathBuf::from(v)
+}
+
+fn log_disabled(v: &str) -> bool {
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off" | "none" | "-"
+    )
 }
 
 fn flag(v: Option<&str>, key: &'static str, default: bool) -> Result<bool, Error> {
@@ -324,6 +366,11 @@ mod tests {
             c.bisync_workdir,
             PathBuf::from("./.local/share/vault-rclone/bisync")
         );
+        assert_eq!(
+            c.sync_log.as_deref(),
+            Some(Path::new("./.local/share/vault-rclone/logs/sync.log"))
+        );
+        assert_eq!(c.sync_log_max_bytes, DEFAULT_SYNC_LOG_MAX_BYTES);
     }
 
     #[test]
@@ -336,6 +383,27 @@ mod tests {
         let env = |k: &str| (k == "BISYNC_WORKDIR").then(|| "~/state/bisync".to_string());
         let c = Config::load_from(env, &[], Some(Path::new("/h"))).unwrap();
         assert_eq!(c.bisync_workdir, PathBuf::from("/h/state/bisync"));
+    }
+
+    #[test]
+    fn sync_log_default_override_and_disable() {
+        let c = Config::load_from(no_env, &[], Some(Path::new("/h"))).unwrap();
+        assert_eq!(
+            c.sync_log.as_deref(),
+            Some(Path::new("/h/.local/share/vault-rclone/logs/sync.log"))
+        );
+        assert_eq!(c.sync_log_max_bytes, 2 * 1024 * 1024);
+        let env = |k: &str| match k {
+            "SYNC_LOG" => Some("~/logs/sync.log".to_string()),
+            "SYNC_LOG_MAX_BYTES" => Some("4096".to_string()),
+            _ => None,
+        };
+        let c = Config::load_from(env, &[], Some(Path::new("/h"))).unwrap();
+        assert_eq!(c.sync_log.as_deref(), Some(Path::new("/h/logs/sync.log")));
+        assert_eq!(c.sync_log_max_bytes, 4096);
+        let off = |k: &str| (k == "SYNC_LOG").then(|| "off".to_string());
+        let c = Config::load_from(off, &[], Some(Path::new("/h"))).unwrap();
+        assert!(c.sync_log.is_none());
     }
 
     #[test]

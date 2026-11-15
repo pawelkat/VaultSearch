@@ -24,8 +24,8 @@ pub struct Host {
     pub path_var: Option<OsString>,
     /// `$XDG_CACHE_HOME`, else `~/.cache`.
     pub cache_dir: Option<PathBuf>,
-    /// `$XDG_STATE_HOME`, else `~/.local/state`. The sync log goes under
-    /// `<state_dir>/vault-rclone/`. `None` disables the log.
+    /// `$XDG_STATE_HOME`, else `~/.local/state`. Unused for the run log
+    /// (that lives at `SYNC_LOG`); kept so Host stays injectable in tests.
     pub state_dir: Option<PathBuf>,
     pub is_exec: fn(&Path) -> bool,
     /// `$XDG_RUNTIME_DIR`, for the default `vault-searchd` socket.
