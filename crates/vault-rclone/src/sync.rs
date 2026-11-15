@@ -241,9 +241,10 @@ fn run_bisync(
     };
     log.line(
         &format!(
-            "start remote={} local={}{}",
+            "start remote={} local={} workdir={}{}",
             cfg.vault_remote,
             local.display(),
+            cfg.bisync_workdir.display(),
             if dry_run { " dry-run" } else { "" }
         ),
         out,
@@ -313,6 +314,16 @@ fn run_bisync(
     if let Some(f) = &filters {
         writeln!(out, "{name}: filters {}", f.display())?;
         log.line(&format!("filters {}", f.display()), out)?;
+    }
+    if let Err(e) = std::fs::create_dir_all(&cfg.bisync_workdir) {
+        return fail(
+            &mut log,
+            out,
+            format!(
+                "cannot create bisync workdir {}: {e}",
+                cfg.bisync_workdir.display()
+            ),
+        );
     }
 
     let opts = BisyncOpts {
@@ -488,7 +499,7 @@ mod tests {
             runtime_dir: None,
             uid: 0,
         };
-        let mut cfg = Config::load_from(|_| None, &[], None).unwrap();
+        let mut cfg = Config::load_from(|_| None, &[], host.home.as_deref()).unwrap();
         cfg.vault_local = Some(vault);
         cfg.rclone_bin = Some(PathBuf::from("/fake/rclone"));
         (dir, host, cfg)
@@ -535,6 +546,12 @@ mod tests {
             .any(|w| w == ["--conflict-resolve", "newer"]));
         assert!(!argv.contains(&"--resync".to_string()));
         assert!(!argv.contains(&"--dry-run".to_string()));
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--workdir", cfg.bisync_workdir.to_str().unwrap()]));
+        assert!(cfg
+            .bisync_workdir
+            .ends_with(".local/share/vault-rclone/bisync"));
         // Size ran before bisync.
         let calls = fake.calls.borrow();
         assert_eq!(calls[0][0], "size");

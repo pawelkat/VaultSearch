@@ -186,13 +186,10 @@ pub fn status(
         "guards:  min-files {}, max-delete {}",
         cfg.min_files, cfg.max_delete
     )?;
+    writeln!(out, "workdir: {}", cfg.bisync_workdir.display())?;
     config_files_line(cfg, out)?;
 
-    let locks = host
-        .cache_dir
-        .as_deref()
-        .map(rclone::bisync_locks)
-        .unwrap_or_default();
+    let locks = rclone::bisync_locks(&cfg.bisync_workdir);
     if locks.is_empty() {
         writeln!(out, "lock:    none")?;
     } else {
@@ -423,7 +420,7 @@ mod tests {
             runtime_dir: None,
             uid: 0,
         };
-        let mut cfg = Config::load_from(|_| None, &[], None).unwrap();
+        let mut cfg = Config::load_from(|_| None, &[], host.home.as_deref()).unwrap();
         cfg.vault_local = Some(vault);
         cfg.rclone_bin = Some(PathBuf::from("/fake/rclone"));
         let fake = Fake {
@@ -519,6 +516,8 @@ mod tests {
         assert!(s.contains("(3 files)"), "{s}");
         assert!(s.contains("remote:  gdrive:Vault"));
         assert!(s.contains("min-files 3, max-delete 50"));
+        assert!(s.contains("workdir:"), "{s}");
+        assert!(s.contains("vault-rclone/bisync"), "{s}");
         assert!(s.contains("lock:    none"));
         assert!(s.contains("ok (120 remote files)"));
         assert!(!s.contains("warning"));
@@ -538,10 +537,9 @@ mod tests {
 
     #[test]
     fn status_flags_lock_and_missing_local() {
-        let (d, host, mut cfg, fake) = setup();
-        let b = d.path().join("cache/rclone/bisync");
-        std::fs::create_dir_all(&b).unwrap();
-        std::fs::write(b.join("x..y.lck"), "").unwrap();
+        let (_d, host, mut cfg, fake) = setup();
+        std::fs::create_dir_all(&cfg.bisync_workdir).unwrap();
+        std::fs::write(cfg.bisync_workdir.join("x..y.lck"), "").unwrap();
         cfg.vault_local = None;
         let (code, s) = run(|o| status(&cfg, &host, &fake, true, o));
         assert_eq!(code, EXIT_FAIL);

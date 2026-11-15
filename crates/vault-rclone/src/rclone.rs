@@ -183,8 +183,10 @@ pub struct BisyncOpts<'a> {
 /// `rclone bisync <VAULT_REMOTE> <VAULT_LOCAL> ...`
 ///
 /// Path1 is the remote and Path2 the local folder, the same order as the
-/// Nitro setup, so bisync's listing files in `~/.cache/rclone/bisync` keep
-/// their names if the bash script and this binary take turns.
+/// Nitro setup, so bisync's listing files under `--workdir` keep their
+/// names if the bash script and this binary take turns. The default workdir
+/// is `~/.local/share/vault-rclone/bisync`, not rclone's
+/// `~/.cache/rclone/bisync` (see [`crate::config::default_bisync_workdir`]).
 ///
 /// Always passes `--max-delete`, newer-wins conflict resolution with a
 /// `*.conflict-…` loser kept, `--fast-list`, `-v` so the run summary
@@ -212,6 +214,8 @@ pub fn bisync_args(cfg: &Config, local: &Path, opts: &BisyncOpts<'_>) -> Vec<Str
             "--fast-list",
             "-v",
             "--disable-http2",
+            "--workdir",
+            &cfg.bisync_workdir.display().to_string(),
         ],
     );
     if let Some(f) = opts.filters_file {
@@ -358,10 +362,9 @@ pub fn safe_summary(stderr: &str) -> String {
     s
 }
 
-/// rclone's bisync lock files (`*.lck`) under `<cache>/rclone/bisync`.
-pub fn bisync_locks(cache_dir: &Path) -> Vec<PathBuf> {
-    let dir = cache_dir.join("rclone").join("bisync");
-    let Ok(rd) = std::fs::read_dir(&dir) else {
+/// rclone's bisync lock files (`*.lck`) in the configured `--workdir`.
+pub fn bisync_locks(workdir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(workdir) else {
         return Vec::new();
     };
     let mut v: Vec<PathBuf> = rd
@@ -509,6 +512,10 @@ mod tests {
         );
         assert!(sync.contains(&"--fast-list".to_string()));
         assert!(sync.contains(&"--disable-http2".to_string()));
+        assert_eq!(
+            flag_value(&sync, "--workdir"),
+            Some(c.bisync_workdir.to_str().unwrap())
+        );
         assert!(!sync.contains(&"--resync".to_string()));
         assert!(!sync.contains(&"--resync-mode".to_string()));
         assert!(!sync.contains(&"--dry-run".to_string()));
@@ -530,6 +537,10 @@ mod tests {
         assert_eq!(flag_value(&re, "--max-delete"), Some("25"));
         assert!(re.contains(&"--dry-run".to_string()));
         assert!(re.contains(&"--disable-http2".to_string()));
+        assert_eq!(
+            flag_value(&re, "--workdir"),
+            Some(c.bisync_workdir.to_str().unwrap())
+        );
 
         c.rclone_config = Some(PathBuf::from("/h/rclone.conf"));
         let g = bisync_args(&c, local, &BisyncOpts::default());
@@ -620,11 +631,9 @@ mod tests {
     fn finds_bisync_locks() {
         let dir = tempfile::tempdir().unwrap();
         assert!(bisync_locks(dir.path()).is_empty());
-        let b = dir.path().join("rclone").join("bisync");
-        std::fs::create_dir_all(&b).unwrap();
-        std::fs::write(b.join("a..b.lck"), "").unwrap();
-        std::fs::write(b.join("a..b.path1.lst"), "").unwrap();
-        assert_eq!(bisync_locks(dir.path()), vec![b.join("a..b.lck")]);
+        std::fs::write(dir.path().join("a..b.lck"), "").unwrap();
+        std::fs::write(dir.path().join("a..b.path1.lst"), "").unwrap();
+        assert_eq!(bisync_locks(dir.path()), vec![dir.path().join("a..b.lck")]);
     }
 
     #[test]

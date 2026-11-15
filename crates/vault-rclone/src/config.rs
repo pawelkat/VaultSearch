@@ -24,6 +24,22 @@ pub const DEFAULT_CONFLICT_SUFFIX: &str = ".conflict-{DateOnly}-";
 /// Embedding many changed notes over HTTP can take a while.
 pub const DEFAULT_REINDEX_TIMEOUT_SECS: u64 = 1800;
 
+/// Relative path under `$HOME` for [`default_bisync_workdir`].
+///
+/// rclone's own default is `~/.cache/rclone/bisync`. On the Grok Bot box the
+/// durable store's `BOX_HOME_REGENERABLE_JUNK_IGNORE_PATTERNS` skips `.cache/`
+/// and `/.local/state/`, so listings written there disappear on the next
+/// hydrate. `~/.local/share/` is kept (aside from `pnpm` and `Trash`), so
+/// the listings live here instead.
+pub const DEFAULT_BISYNC_WORKDIR_REL: &str = ".local/share/vault-rclone/bisync";
+
+/// `$HOME/.local/share/vault-rclone/bisync`, or the same relative path when
+/// `HOME` is unknown (tests).
+pub fn default_bisync_workdir(home: Option<&Path>) -> PathBuf {
+    home.unwrap_or_else(|| Path::new("."))
+        .join(DEFAULT_BISYNC_WORKDIR_REL)
+}
+
 /// Keys this crate reads. Anything else in a config file is ignored and never printed.
 pub const KNOWN_KEYS: &[&str] = &[
     "VAULT_LOCAL",
@@ -37,6 +53,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "VAULT_SEARCH_SOCKET",
     "VAULT_REINDEX",
     "VAULT_REINDEX_TIMEOUT_SECS",
+    "BISYNC_WORKDIR",
 ];
 
 /// Resolved settings. Holds paths only, never credentials.
@@ -62,6 +79,9 @@ pub struct Config {
     pub search_socket: Option<PathBuf>,
     /// `VAULT_REINDEX_TIMEOUT_SECS`: read timeout for the reindex reply.
     pub reindex_timeout_secs: u64,
+    /// `--workdir` for bisync listings and lock files. Default
+    /// `~/.local/share/vault-rclone/bisync` (see [`default_bisync_workdir`]).
+    pub bisync_workdir: PathBuf,
     /// Config files that existed and were read, lowest precedence first.
     pub files_read: Vec<PathBuf>,
 }
@@ -134,6 +154,8 @@ impl Config {
                 "VAULT_REINDEX_TIMEOUT_SECS",
                 DEFAULT_REINDEX_TIMEOUT_SECS,
             )?,
+            bisync_workdir: path_of("BISYNC_WORKDIR")
+                .unwrap_or_else(|| default_bisync_workdir(home)),
             files_read,
         })
     }
@@ -298,6 +320,22 @@ mod tests {
         assert!(c.reindex);
         assert!(c.search_socket.is_none());
         assert_eq!(c.reindex_timeout_secs, 1800);
+        assert_eq!(
+            c.bisync_workdir,
+            PathBuf::from("./.local/share/vault-rclone/bisync")
+        );
+    }
+
+    #[test]
+    fn bisync_workdir_default_and_override() {
+        let c = Config::load_from(no_env, &[], Some(Path::new("/h"))).unwrap();
+        assert_eq!(
+            c.bisync_workdir,
+            PathBuf::from("/h/.local/share/vault-rclone/bisync")
+        );
+        let env = |k: &str| (k == "BISYNC_WORKDIR").then(|| "~/state/bisync".to_string());
+        let c = Config::load_from(env, &[], Some(Path::new("/h"))).unwrap();
+        assert_eq!(c.bisync_workdir, PathBuf::from("/h/state/bisync"));
     }
 
     #[test]

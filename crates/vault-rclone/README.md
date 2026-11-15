@@ -39,11 +39,12 @@ Then bisync runs as:
 rclone [--config RCLONE_CONFIG] bisync <VAULT_REMOTE> <VAULT_LOCAL> \
   --max-delete <MAX_DELETE> \
   --conflict-resolve newer --conflict-loser num --conflict-suffix <CONFLICT_SUFFIX> \
-  --fast-list -v --disable-http2 \
+  --fast-list -v --disable-http2 --workdir <BISYNC_WORKDIR> \
   [--filters-file <file>] [--resync --resync-mode newer] [--dry-run]
 ```
 
-- Path1 is the remote and Path2 is the local folder. Listing files in `~/.cache/rclone/bisync` are named from that order. The old bash `vault-sync` on Nitro ran `bisync <local> <remote>`, so its listings do not match. The first switch exits 7 (`Must run --resync`) until the cutover below.
+- Path1 is the remote and Path2 is the local folder. Listing files in `BISYNC_WORKDIR` (default `~/.local/share/vault-rclone/bisync`) are named from that order. The old bash `vault-sync` on Nitro ran `bisync <local> <remote>`, so its listings do not match. The first switch exits 7 (`Must run --resync`) until the cutover below.
+- `--workdir` is always passed. rclone's own default, `~/.cache/rclone/bisync`, is not durable on the Grok Bot box: the box-store hydrate ignores `.cache/` and `/.local/state/` (`BOX_HOME_REGENERABLE_JUNK_IGNORE_PATTERNS`), so a baseline written there vanished on the next image update. `~/.local/share/` is persisted (aside from `pnpm` and `Trash`). Do not point `BISYNC_WORKDIR` at `~/.cache` or `~/.local/state`.
 - `--max-delete` is always passed. For `bisync` it is a **percentage** of files (rclone default 50%), not a count as it is for `rclone sync`. The default `MAX_DELETE=50` therefore matches rclone's own default; set it lower to be stricter.
 - Conflicts: the newer file wins, the loser is renamed, not deleted. With the default `CONFLICT_SUFFIX=.conflict-{DateOnly}-` a losing `note.md` becomes `note.md..conflict-2026-10-30-1` (rclone adds the leading `.` and the number). `{DateOnly}` is an rclone date macro. The existing vault file `2026-10-23.md..conflict-Date1` suggests the bash script passes `.conflict-{Date}`, which rclone does not expand (it writes the literal `Date`); set `CONFLICT_SUFFIX=.conflict-{Date}` for an exact match.
 - `--resync-mode newer` keeps the newer copy on resync instead of rclone's default "Path1 (Drive) always wins".
@@ -91,6 +92,7 @@ Read from `~/.config/vault-sync/config.env`, then `~/.config/vault-rclone/config
 | `VAULT_REINDEX` | `1`; `0`/`false`/`no`/`off` skips the post-sync reindex |
 | `VAULT_SEARCH_SOCKET` | `$XDG_RUNTIME_DIR/vault-search.sock`, else `/tmp/vault-search-$UID.sock` |
 | `VAULT_REINDEX_TIMEOUT_SECS` | `1800` |
+| `BISYNC_WORKDIR` | `~/.local/share/vault-rclone/bisync` (listings and `*.lck`; created if missing) |
 
 ## Cut over from bash `vault-sync`
 
@@ -119,7 +121,7 @@ Known differences from that bash script, left as-is after the clean incremental 
 - Same filters file (`~/.config/vault-sync/filters.txt`) when `FILTERS_FILE` points at it.
 - This crate does not write a summary into `Vault/Reviews/`.
 - Exit 7 does not auto-resync. The bash script could force `--resync` after repeated failures. Here a human checks both sides, runs `resync --dry-run`, then (if that looks right) a real `resync`. A dry-run only writes `*.lst-dry` and leaves the next incremental `sync` at exit 7. The exit-7 hint is written to stdout and to the run log, and it names both commands.
-- `--resilient` and `--recover` are still off. They would let later incremental runs retry after some interruptions without a human `--resync`, which is useful, but it also changes when a baseline is discarded. Leave them off until that is an explicit policy; a hung or killed run still needs the lock file removed if rclone left one behind (`~/.cache/rclone/bisync/*.lck`).
+- `--resilient` and `--recover` are still off. They would let later incremental runs retry after some interruptions without a human `--resync`, which is useful, but it also changes when a baseline is discarded. Leave them off until that is an explicit policy; a hung or killed run still needs the lock file removed if rclone left one behind (`$BISYNC_WORKDIR/*.lck`, default `~/.local/share/vault-rclone/bisync/*.lck`).
 
 ## Tests
 
