@@ -241,9 +241,10 @@ fn run_bisync(
     };
     log.line(
         &format!(
-            "start remote={} local={}{}",
+            "start remote={} local={} workdir={}{}",
             cfg.vault_remote,
             local.display(),
+            cfg.bisync_workdir.display(),
             if dry_run { " dry-run" } else { "" }
         ),
         out,
@@ -314,6 +315,16 @@ fn run_bisync(
         writeln!(out, "{name}: filters {}", f.display())?;
         log.line(&format!("filters {}", f.display()), out)?;
     }
+    if let Err(e) = std::fs::create_dir_all(&cfg.bisync_workdir) {
+        return fail(
+            &mut log,
+            out,
+            format!(
+                "cannot create bisync workdir {}: {e}",
+                cfg.bisync_workdir.display()
+            ),
+        );
+    }
 
     let opts = BisyncOpts {
         resync,
@@ -334,10 +345,12 @@ fn run_bisync(
                 writeln!(out, "{name}: FAILED (rclone exit {code}): {err}")?;
                 log.line(&format!("rclone error: {err}"), out)?;
                 if code == 7 {
-                    writeln!(
-                        out,
-                        "{name}: rclone needs a resync; check the vault first, then `vault-rclone resync --dry-run`"
-                    )?;
+                    // Incremental sync cannot create the baseline. A dry-run
+                    // resync writes only *.lst-dry and leaves the next sync
+                    // at exit 7; the real `resync` is required after it.
+                    let hint = "rclone exit 7: no bisync baseline (or a critical error). Incremental sync cannot recover. Check both sides, then run `vault-rclone resync --dry-run` and, if that looks right, `vault-rclone resync`.";
+                    writeln!(out, "{name}: {hint}")?;
+                    log.line(hint, out)?;
                 }
             }
             code
@@ -486,7 +499,7 @@ mod tests {
             runtime_dir: None,
             uid: 0,
         };
-        let mut cfg = Config::load_from(|_| None, &[], None).unwrap();
+        let mut cfg = Config::load_from(|_| None, &[], host.home.as_deref()).unwrap();
         cfg.vault_local = Some(vault);
         cfg.rclone_bin = Some(PathBuf::from("/fake/rclone"));
         (dir, host, cfg)
@@ -533,6 +546,12 @@ mod tests {
             .any(|w| w == ["--conflict-resolve", "newer"]));
         assert!(!argv.contains(&"--resync".to_string()));
         assert!(!argv.contains(&"--dry-run".to_string()));
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--workdir", cfg.bisync_workdir.to_str().unwrap()]));
+        assert!(cfg
+            .bisync_workdir
+            .ends_with(".local/share/vault-rclone/bisync"));
         // Size ran before bisync.
         let calls = fake.calls.borrow();
         assert_eq!(calls[0][0], "size");
@@ -612,10 +631,14 @@ mod tests {
         let (code, s) = run(|o| sync(&cfg, &host, &fake, &NoDaemon, false, o));
         assert_eq!(code, 7);
         assert!(s.contains("FAILED (rclone exit 7)"), "{s}");
+        assert!(s.contains("no bisync baseline"), "{s}");
         assert!(s.contains("resync --dry-run"), "{s}");
+        assert!(s.contains("`vault-rclone resync`"), "{s}");
         let log = read_log(&host);
         assert!(log.contains("sync start"), "{log}");
         assert!(log.contains("Path1:    2 changes"), "{log}");
+        assert!(log.contains("no bisync baseline"), "{log}");
+        assert!(log.contains("vault-rclone resync"), "{log}");
         assert!(log.contains("end exit=7"), "{log}");
         assert_no_secrets(&s);
         assert_no_secrets(&log);

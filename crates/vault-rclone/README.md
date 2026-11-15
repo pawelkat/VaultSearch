@@ -39,15 +39,21 @@ Then bisync runs as:
 rclone [--config RCLONE_CONFIG] bisync <VAULT_REMOTE> <VAULT_LOCAL> \
   --max-delete <MAX_DELETE> \
   --conflict-resolve newer --conflict-loser num --conflict-suffix <CONFLICT_SUFFIX> \
-  --fast-list -v \
+  --fast-list -v --disable-http2 --workdir <BISYNC_WORKDIR> \
   [--filters-file <file>] [--resync --resync-mode newer] [--dry-run]
 ```
 
-- Path1 is the remote and Path2 is the local folder. Listing files in `~/.cache/rclone/bisync` are named from that order. The old bash `vault-sync` on Nitro ran `bisync <local> <remote>`, so its listings do not match. The first switch exits 7 (`Must run --resync`) until the cutover below.
+- Path1 is the remote and Path2 is the local folder. Listing files in `BISYNC_WORKDIR` (default `~/.local/share/vault-rclone/bisync`) are named from that order. The old bash `vault-sync` on Nitro ran `bisync <local> <remote>`, so its listings do not match. The first switch exits 7 (`Must run --resync`) until the cutover below.
+- `--workdir` is always passed. rclone's own default, `~/.cache/rclone/bisync`, is not durable on the Grok Bot box: the box-store hydrate ignores `.cache/` and `/.local/state/` (`BOX_HOME_REGENERABLE_JUNK_IGNORE_PATTERNS`), so a baseline written there vanished on the next image update. `~/.local/share/` is persisted (aside from `pnpm` and `Trash`). Do not point `BISYNC_WORKDIR` at `~/.cache` or `~/.local/state`.
 - `--max-delete` is always passed. For `bisync` it is a **percentage** of files (rclone default 50%), not a count as it is for `rclone sync`. The default `MAX_DELETE=50` therefore matches rclone's own default; set it lower to be stricter.
 - Conflicts: the newer file wins, the loser is renamed, not deleted. With the default `CONFLICT_SUFFIX=.conflict-{DateOnly}-` a losing `note.md` becomes `note.md..conflict-2026-10-30-1` (rclone adds the leading `.` and the number). `{DateOnly}` is an rclone date macro. The existing vault file `2026-10-23.md..conflict-Date1` suggests the bash script passes `.conflict-{Date}`, which rclone does not expand (it writes the literal `Date`); set `CONFLICT_SUFFIX=.conflict-{Date}` for an exact match.
 - `--resync-mode newer` keeps the newer copy on resync instead of rclone's default "Path1 (Drive) always wins".
 - `--fast-list` is bisync's default already; it is passed explicitly for clarity.
+- `--disable-http2` avoids a hang observed on the Grok Bot box: a real
+  `--resync` sat idle for minutes on several HTTP/2 connections through the
+  egress proxy, with listing files never growing past the header. The same
+  command finished in seconds once HTTP/2 was disabled. Incremental `sync`
+  uses the same flag so a later run cannot stick the same way.
 
 ## Reindex after sync
 
@@ -86,6 +92,7 @@ Read from `~/.config/vault-sync/config.env`, then `~/.config/vault-rclone/config
 | `VAULT_REINDEX` | `1`; `0`/`false`/`no`/`off` skips the post-sync reindex |
 | `VAULT_SEARCH_SOCKET` | `$XDG_RUNTIME_DIR/vault-search.sock`, else `/tmp/vault-search-$UID.sock` |
 | `VAULT_REINDEX_TIMEOUT_SECS` | `1800` |
+| `BISYNC_WORKDIR` | `~/.local/share/vault-rclone/bisync` (listings and `*.lck`; created if missing) |
 
 ## Cut over from bash `vault-sync`
 
@@ -108,12 +115,13 @@ Nitro did this on 2026-10-31. The first incremental sync exited 7 because of the
 
 Known differences from that bash script, left as-is after the clean incremental run:
 
-- No `--resilient`, `--recover`, `--max-lock`, `--create-empty-src-dirs`, `--compare size,modtime`, `--drive-skip-gdocs`, or `--fix-case`.
+- No `--resilient`, `--recover`, `--max-lock`, `--create-empty-src-dirs`, `--compare size,modtime`, `--drive-skip-gdocs`, or `--fix-case`. `--disable-http2` is now passed (see above).
 - `--conflict-loser num`, not `pathname`. Set `CONFLICT_SUFFIX=.conflict-{Date}` to keep the bash loser name. The crate default is `.conflict-{DateOnly}-`.
 - `--max-delete` is a bisync percentage. `50` matches the bash value and rclone's own default.
 - Same filters file (`~/.config/vault-sync/filters.txt`) when `FILTERS_FILE` points at it.
 - This crate does not write a summary into `Vault/Reviews/`.
-- Exit 7 does not auto-resync. The bash script could force `--resync` after repeated failures. Here a human runs `resync --dry-run` first.
+- Exit 7 does not auto-resync. The bash script could force `--resync` after repeated failures. Here a human checks both sides, runs `resync --dry-run`, then (if that looks right) a real `resync`. A dry-run only writes `*.lst-dry` and leaves the next incremental `sync` at exit 7. The exit-7 hint is written to stdout and to the run log, and it names both commands.
+- `--resilient` and `--recover` are still off. They would let later incremental runs retry after some interruptions without a human `--resync`, which is useful, but it also changes when a baseline is discarded. Leave them off until that is an explicit policy; a hung or killed run still needs the lock file removed if rclone left one behind (`$BISYNC_WORKDIR/*.lck`, default `~/.local/share/vault-rclone/bisync/*.lck`).
 
 ## Tests
 
