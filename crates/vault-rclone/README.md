@@ -73,7 +73,7 @@ By hand: `vault-searchd reindex [--socket PATH] [--timeout-secs 1800]` sends the
 
 ## Run log
 
-Each `sync` / `resync` appends to `$XDG_STATE_HOME/vault-rclone/sync.log` (default `~/.local/state/vault-rclone/sync.log`): start (remote, local, dry-run), guard result or refusal, rclone's change totals and verdict, a conflict count, and `end exit=N`. Times are UTC. Per-file lines, note names, rclone.conf, and tokens are never logged; error lines go through the same credential filter as `check-config`. Nothing is written into the vault.
+Each `sync` / `resync` appends to `SYNC_LOG` (default `~/.local/share/vault-rclone/logs/sync.log`): start (remote, local, workdir, dry-run), guard result or refusal, rclone's change totals and verdict, a conflict count, and `end exit=N`. Times are UTC. Per-file lines, note names, rclone.conf, and tokens are never logged; error lines go through the same credential filter as `check-config`. Nothing is written into the vault. When the file exceeds `SYNC_LOG_MAX_BYTES` (default 2 MiB) it is renamed to `sync.log.1` (one backup) and a new log is started. Set `SYNC_LOG=off` to disable the log. The default lives under `~/.local/share` because the Grok Bot box store ignores `~/.local/state`.
 
 ## Settings
 
@@ -93,6 +93,8 @@ Read from `~/.config/vault-sync/config.env`, then `~/.config/vault-rclone/config
 | `VAULT_SEARCH_SOCKET` | `$XDG_RUNTIME_DIR/vault-search.sock`, else `/tmp/vault-search-$UID.sock` |
 | `VAULT_REINDEX_TIMEOUT_SECS` | `1800` |
 | `BISYNC_WORKDIR` | `~/.local/share/vault-rclone/bisync` (listings and `*.lck`; created if missing) |
+| `SYNC_LOG` | `~/.local/share/vault-rclone/logs/sync.log`; `off`/`false`/`no`/`none`/`-` disables it |
+| `SYNC_LOG_MAX_BYTES` | `2097152` (2 MiB); `0` disables rotation |
 
 ## Cut over from bash `vault-sync`
 
