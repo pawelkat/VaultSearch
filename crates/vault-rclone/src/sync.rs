@@ -245,6 +245,92 @@ pub fn resync(
     run_bisync(cfg, host, runner, reindexer, true, dry_run, out)
 }
 
+/// `vault-rclone backup`: one-way `rclone copy --update` local -> Drive.
+///
+/// For the event-sync hub: Drive becomes a backup that is only written
+/// from the hub's tree. Nothing on Drive is deleted and newer Drive files
+/// are never overwritten. Guards: `VAULT_LOCAL` is a directory holding at
+/// least `MIN_FILES` files. No reindex afterwards (the local tree did not
+/// change).
+pub fn backup(
+    cfg: &Config,
+    host: &Host,
+    runner: &dyn CommandRunner,
+    dry_run: bool,
+    out: &mut dyn Write,
+) -> io::Result<i32> {
+    let name = "backup";
+    let mut log = RunLog::new(cfg, name);
+    let fail = |log: &mut RunLog, out: &mut dyn Write, msg: String| -> io::Result<i32> {
+        writeln!(out, "{name}: {msg}")?;
+        log.line(&format!("refused: {msg}"), out)?;
+        log.line(&format!("end exit={EXIT_FAIL}"), out)?;
+        Ok(EXIT_FAIL)
+    };
+    let local: &Path = match cfg.require_local() {
+        Ok(p) => p,
+        Err(e) => return fail(&mut log, out, e.to_string()),
+    };
+    log.line(
+        &format!(
+            "start local={} -> remote={} (copy --update){}",
+            local.display(),
+            cfg.vault_remote,
+            if dry_run { " dry-run" } else { "" }
+        ),
+        out,
+    )?;
+    if !local.is_dir() {
+        return fail(
+            &mut log,
+            out,
+            format!("{} is missing or not a directory", local.display()),
+        );
+    }
+    let min = u64::from(cfg.min_files);
+    match count_local_files(local) {
+        Ok(n) if n >= min => {}
+        Ok(n) => {
+            return fail(
+                &mut log,
+                out,
+                format!(
+                    "local {} has {n} files, below MIN_FILES={min}; refusing",
+                    local.display()
+                ),
+            )
+        }
+        Err(e) => return fail(&mut log, out, format!("cannot count local files: {e}")),
+    }
+    let bin = match host.locate(cfg) {
+        Ok(b) => b,
+        Err(e) => return fail(&mut log, out, e.to_string()),
+    };
+    let filters = match resolve_filters(cfg, host) {
+        Ok(f) => f,
+        Err(e) => return fail(&mut log, out, e.to_string()),
+    };
+    let args = rclone::backup_args(cfg, local, filters.as_deref(), dry_run);
+    let code = match runner.run(&bin, &args) {
+        Ok(o) => {
+            let code = exit_code(&o);
+            if code != EXIT_OK {
+                let err = error_line(&o.stderr);
+                writeln!(out, "{name}: FAILED (rclone exit {code}): {err}")?;
+                log.line(&format!("rclone error: {err}"), out)?;
+            }
+            code
+        }
+        Err(e) => {
+            writeln!(out, "{name}: FAILED ({e})")?;
+            log.line(&format!("spawn error: {e}"), out)?;
+            EXIT_FAIL
+        }
+    };
+    log.line(&format!("end exit={code}"), out)?;
+    Ok(code)
+}
+
 fn run_bisync(
     cfg: &Config,
     host: &Host,

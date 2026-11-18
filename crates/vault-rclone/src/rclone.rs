@@ -231,6 +231,40 @@ pub fn bisync_args(cfg: &Config, local: &Path, opts: &BisyncOpts<'_>) -> Vec<Str
     v
 }
 
+/// `rclone copy <VAULT_LOCAL> <VAULT_REMOTE> --update ...` — the one-way
+/// Drive backup used when the event hub is the primary sync path.
+///
+/// `copy` never deletes on the destination, and `--update` skips any file
+/// whose Drive copy is newer, so a stale local tree cannot overwrite newer
+/// Drive edits made through the bisync fallback.
+pub fn backup_args(
+    cfg: &Config,
+    local: &Path,
+    filters_file: Option<&Path>,
+    dry_run: bool,
+) -> Vec<String> {
+    let mut v = with_globals(
+        cfg,
+        &[
+            "copy",
+            &local.display().to_string(),
+            &cfg.vault_remote,
+            "--update",
+            "--fast-list",
+            "-v",
+            "--disable-http2",
+        ],
+    );
+    if let Some(f) = filters_file {
+        v.push("--filters-file".into());
+        v.push(f.display().to_string());
+    }
+    if dry_run {
+        v.push("--dry-run".into());
+    }
+    v
+}
+
 /// High-level lines from a verbose bisync log: change counts, conflicts, and
 /// the final verdict. Per-file lines are dropped so the log stays short and
 /// note names do not pile up outside the vault.

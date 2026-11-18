@@ -50,6 +50,14 @@ enum Cmd {
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
+    /// One-way backup: rclone copy --update VAULT_LOCAL -> VAULT_REMOTE.
+    /// Never deletes on Drive, never overwrites a newer Drive file. For the
+    /// event-sync hub (vault-events); bisync stays the fallback.
+    Backup {
+        /// Pass --dry-run to rclone.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
     /// List the remote's top level (or VAULT_LOCAL's with --local).
     Lsf {
         /// List VAULT_LOCAL instead of the remote.
@@ -75,6 +83,7 @@ fn main() -> ExitCode {
         Cmd::Status { offline } => commands::status(&cfg, &host, r, offline, &mut out),
         Cmd::CheckConfig { offline } => commands::check_config(&cfg, &host, r, offline, &mut out),
         Cmd::Sync { dry_run } => sync::sync(&cfg, &host, r, &SocketReindexer, dry_run, &mut out),
+        Cmd::Backup { dry_run } => sync::backup(&cfg, &host, r, dry_run, &mut out),
         Cmd::Resync { dry_run } => {
             sync::resync(&cfg, &host, r, &SocketReindexer, dry_run, &mut out)
         }
