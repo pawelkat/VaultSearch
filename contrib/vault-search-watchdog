@@ -37,6 +37,10 @@
 #   VAULT_EVENTS_DEVICE=box         device id in events / conflict names
 #   VAULT_EVENTS_LISTEN=tcp/0.0.0.0:7447   hub listen endpoint
 #   VAULT_EVENTS_CONNECT=tcp/127.0.0.1:7447 agent hub endpoint
+#   VAULT_EVENTS_HUB_CONNECT=""     space-separated routers the hub dials out
+#                                   to (e.g. tcp/note4.<tailnet>.ts.net:7447);
+#                                   the way in when this host cannot accept
+#                                   inbound tailnet connections
 #   VAULT_EVENTS_BACKUP=0           1 = hub runs `vault-rclone backup`
 #                                   (one-way copy --update to Drive)
 #   VAULT_EVENTS_BACKUP_DRY_RUN=1   backup with --dry-run only (default 1)
@@ -299,6 +303,10 @@ start_events_hub() {
 	local listen args=()
 	listen="$(events_get VAULT_EVENTS_LISTEN tcp/0.0.0.0:7447)"
 	args=(hub --data-dir "${EVENTS_SHARE}/hub" --listen "${listen}" --name "$(events_get VAULT_EVENTS_DEVICE box)")
+	local ep
+	for ep in $(events_get VAULT_EVENTS_HUB_CONNECT ""); do
+		args+=(--connect "${ep}")
+	done
 	if [ "$(events_get VAULT_EVENTS_BACKUP 0)" = "1" ] && [ -f "${SYNC_CONFIG}" ]; then
 		args+=(--backup-config "${SYNC_CONFIG}")
 		if [ "$(events_get VAULT_EVENTS_BACKUP_DRY_RUN 1)" = "1" ]; then
@@ -456,13 +464,15 @@ cmd_detach_loop() {
 }
 
 install_self() {
-	mkdir -p "${HOME}/.local/bin"
-	local self
+	mkdir -p "${HOME}/.local/bin" "${DURABLE_BIN}"
+	local self dest
 	self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-	if [ "${self}" != "${HOME}/.local/bin/vault-search-watchdog" ]; then
-		cp -f "${self}" "${HOME}/.local/bin/vault-search-watchdog"
-		chmod 0755 "${HOME}/.local/bin/vault-search-watchdog"
-	fi
+	for dest in "${HOME}/.local/bin/vault-search-watchdog" "${DURABLE_BIN}/vault-search-watchdog"; do
+		if [ "${self}" != "${dest}" ]; then
+			cp -f "${self}" "${dest}"
+			chmod 0755 "${dest}"
+		fi
+	done
 }
 
 cmd_install_hook() {
@@ -502,13 +512,17 @@ start = "# >>> vault-search-watchdog hook >>>\n"
 end = "# <<< vault-search-watchdog hook <<<\n"
 body = """# >>> vault-search-watchdog hook >>>
 # Start embedder + vault-searchd on box boot. systemd is not PID 1 on this image.
-if [ -x /home/box/.local/bin/vault-search-watchdog ]; then
+# ~/.local/bin can be dropped by a store hydrate; ~/.local/share survives.
+_vs_wd=/home/box/.local/bin/vault-search-watchdog
+[ -x "${_vs_wd}" ] || _vs_wd=/home/box/.local/share/vault-search/bin/vault-search-watchdog
+if [ -x "${_vs_wd}" ]; then
 	if [ "${#AS_BOX[@]}" -gt 0 ] 2>/dev/null; then
-		"${AS_BOX[@]}" /home/box/.local/bin/vault-search-watchdog detach-loop >>/tmp/vault-search-watchdog-boot.log 2>&1 || true
+		"${AS_BOX[@]}" "${_vs_wd}" detach-loop >>/tmp/vault-search-watchdog-boot.log 2>&1 || true
 	else
-		/usr/bin/runuser -u box -- /home/box/.local/bin/vault-search-watchdog detach-loop >>/tmp/vault-search-watchdog-boot.log 2>&1 || true
+		/usr/bin/runuser -u box -- "${_vs_wd}" detach-loop >>/tmp/vault-search-watchdog-boot.log 2>&1 || true
 	fi
 fi
+unset _vs_wd
 # <<< vault-search-watchdog hook <<<
 """
 if start in src and end in src:
@@ -625,6 +639,7 @@ shell_bootstrap_body() {
 # The default Cursor/Grok Shell tool is non-interactive and does not source
 # ~/.bashrc (it returns at the interactive guard); use bash -l or bash -i.
 _vs_wd="${HOME}/.local/bin/vault-search-watchdog"
+[ -x "${_vs_wd}" ] || _vs_wd="${HOME}/.local/share/vault-search/bin/vault-search-watchdog"
 _vs_pidf="${HOME}/.local/state/vault-search/watchdog-loop.pid"
 if [ -n "${VAULT_SEARCH_STATE_DIR:-}" ]; then
 	_vs_pidf="${VAULT_SEARCH_STATE_DIR}/watchdog-loop.pid"

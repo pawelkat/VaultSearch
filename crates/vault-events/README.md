@@ -172,6 +172,7 @@ Off by default. Enable with `~/.config/vault-events/config.env`
 VAULT_EVENTS_ENABLE=1
 VAULT_EVENTS_DEVICE=box
 # VAULT_EVENTS_LISTEN=tcp/0.0.0.0:7447
+# VAULT_EVENTS_HUB_CONNECT=tcp/note4.<tailnet>.ts.net:7447   # dial out to a peer router
 # VAULT_EVENTS_BACKUP=0            # 1: hub runs vault-rclone backup
 # VAULT_EVENTS_BACKUP_DRY_RUN=1
 # VAULT_EVENTS_DISABLE_BISYNC=0    # 1: vault-searchd without --sync-interval
