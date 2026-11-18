@@ -191,14 +191,23 @@ impl AgentCore {
                 tracing::debug!("not syncing {rel}: {why}");
                 Ok(None)
             }
-            Disk::Present { sha256, bytes, .. } => {
+            Disk::Present {
+                sha256,
+                bytes,
+                mtime_ms,
+                ..
+            } => {
                 if prev_sha.as_deref() == Some(sha256.as_str()) {
                     // Content unchanged (touch, or our own write): refresh cache.
                     let s = prev.expect("prev").clone();
                     self.record(s);
                     return Ok(None);
                 }
-                let ev = NoteEvent::put(rel, bytes, &self.device, version, prev_sha, now_ms());
+                // ts = file mtime (the edit time), so a first join compares
+                // like rclone's "newer wins" instead of "whoever published
+                // last". Only a tie-break after the version counter.
+                let ts = if mtime_ms > 0 { mtime_ms } else { now_ms() };
+                let ev = NoteEvent::put(rel, bytes, &self.device, version, prev_sha, ts);
                 self.record(ev.stamp.clone());
                 Ok(Some(ev))
             }

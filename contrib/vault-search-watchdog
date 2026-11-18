@@ -28,6 +28,23 @@
 #   VAULT_SEARCH_LOG_MAX_BYTES      rotate a log when it exceeds this (default
 #                                   2097152). 0 disables rotation.
 #   VAULT_SEARCH_STATE_DIR          pid/lock files (default ~/.local/state/vault-search)
+#
+# Event sync (vault-events hub + agent), OFF unless enabled in
+# ~/.config/vault-events/config.env (or VAULT_EVENTS_CONFIG):
+#   VAULT_EVENTS_ENABLE=1           start/supervise `vault-events hub` and
+#                                   `vault-events agent` (default 0 = off)
+#   VAULT_EVENTS_HUB=1              run the hub on this host (default 1)
+#   VAULT_EVENTS_DEVICE=box         device id in events / conflict names
+#   VAULT_EVENTS_LISTEN=tcp/0.0.0.0:7447   hub listen endpoint
+#   VAULT_EVENTS_CONNECT=tcp/127.0.0.1:7447 agent hub endpoint
+#   VAULT_EVENTS_BACKUP=0           1 = hub runs `vault-rclone backup`
+#                                   (one-way copy --update to Drive)
+#   VAULT_EVENTS_BACKUP_DRY_RUN=1   backup with --dry-run only (default 1)
+#   VAULT_EVENTS_DISABLE_BISYNC=0   1 = start vault-searchd without
+#                                   --sync-interval (event path primary)
+# Logs: hub.log and agent.log next to the others, same rotation.
+# Binaries are looked up in ~/.local/bin, then ~/.local/share/vault-search/bin
+# (the latter survives a box store hydrate that drops ~/.local/bin).
 set -euo pipefail
 
 PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
@@ -42,7 +59,21 @@ SOCK="${RUNTIME_DIR}/vault-search.sock"
 EMBED_URL="http://127.0.0.1:8081"
 EMBED_HEALTH="${EMBED_URL}/health"
 EMBED_PY_VENV="${SHARE_DIR}/venv/bin/python"
-SEARCHD="${HOME}/.local/bin/vault-searchd"
+DURABLE_BIN="${SHARE_DIR}/bin"
+find_bin() {
+	local name="${1}"
+	if [ -x "${HOME}/.local/bin/${name}" ]; then
+		printf '%s\n' "${HOME}/.local/bin/${name}"
+	elif [ -x "${DURABLE_BIN}/${name}" ]; then
+		printf '%s\n' "${DURABLE_BIN}/${name}"
+	else
+		printf '%s\n' "${HOME}/.local/bin/${name}"
+	fi
+}
+SEARCHD="$(find_bin vault-searchd)"
+EVENTS_BIN="$(find_bin vault-events)"
+EVENTS_CONFIG="${VAULT_EVENTS_CONFIG:-${HOME}/.config/vault-events/config.env}"
+EVENTS_SHARE="${HOME}/.local/share/vault-events"
 INDEX="${SHARE_DIR}/index.db"
 SYNC_CONFIG="${HOME}/.config/vault-rclone/config.env"
 INTERVAL="${VAULT_SEARCH_WATCHDOG_INTERVAL:-15}"
@@ -69,6 +100,8 @@ rotate_logs() {
 	rotate_log "${LOG_DIR}/watchdog.log"
 	rotate_log "${LOG_DIR}/embed.log"
 	rotate_log "${LOG_DIR}/searchd.log"
+	rotate_log "${LOG_DIR}/hub.log"
+	rotate_log "${LOG_DIR}/agent.log"
 }
 
 log() {
@@ -194,7 +227,7 @@ start_searchd() {
 	# proxy (idle connections, no listing progress). HTTP/1.1 is reliable here.
 	export RCLONE_DISABLE_HTTP2=true
 	log "starting vault-searchd (socket ${SOCK})"
-	if [ -f "${SYNC_CONFIG}" ]; then
+	if [ -f "${SYNC_CONFIG}" ] && ! { events_enabled && [ "$(events_get VAULT_EVENTS_DISABLE_BISYNC 0)" = "1" ]; }; then
 		setsid nohup "${SEARCHD}" serve \
 			--vault "${vault}" \
 			--index "${INDEX}" \
@@ -224,6 +257,102 @@ start_searchd() {
 	return 1
 }
 
+# --- vault-events (event sync, stage 1) ---------------------------------
+
+# Value of KEY from the events config file (environment wins), or DEFAULT.
+events_get() {
+	local key="${1}" def="${2:-}" val=""
+	val="$(printenv "${key}" 2>/dev/null || true)"
+	if [ -z "${val}" ] && [ -f "${EVENTS_CONFIG}" ]; then
+		# shellcheck disable=SC1090
+		val="$(. "${EVENTS_CONFIG}" >/dev/null 2>&1; eval "printf '%s' \"\${${key}:-}\"")"
+	fi
+	printf '%s' "${val:-${def}}"
+}
+
+events_enabled() {
+	[ "$(events_get VAULT_EVENTS_ENABLE 0)" = "1" ]
+}
+
+events_pids() {
+	local role="${1}"
+	ps -eo pid=,args= | awk -v r="vault-events ${role}" 'index($0, r) && !/awk / { print $1 }'
+}
+
+hub_healthy() {
+	[ -n "$(events_pids hub)" ]
+}
+
+agent_healthy() {
+	[ -n "$(events_pids agent)" ]
+}
+
+start_events_hub() {
+	[ "$(events_get VAULT_EVENTS_HUB 1)" = "1" ] || return 0
+	if hub_healthy; then
+		return 0
+	fi
+	if [ ! -x "${EVENTS_BIN}" ]; then
+		log "vault-events missing at ${EVENTS_BIN}"
+		return 1
+	fi
+	local listen args=()
+	listen="$(events_get VAULT_EVENTS_LISTEN tcp/0.0.0.0:7447)"
+	args=(hub --data-dir "${EVENTS_SHARE}/hub" --listen "${listen}" --name "$(events_get VAULT_EVENTS_DEVICE box)")
+	if [ "$(events_get VAULT_EVENTS_BACKUP 0)" = "1" ] && [ -f "${SYNC_CONFIG}" ]; then
+		args+=(--backup-config "${SYNC_CONFIG}")
+		if [ "$(events_get VAULT_EVENTS_BACKUP_DRY_RUN 1)" = "1" ]; then
+			args+=(--backup-dry-run)
+		fi
+	fi
+	mkdir -p "${EVENTS_SHARE}/hub" "${LOG_DIR}" "${STATE_DIR}"
+	export RCLONE_DISABLE_HTTP2=true
+	log "starting vault-events ${args[*]}"
+	setsid nohup "${EVENTS_BIN}" "${args[@]}" >>"${LOG_DIR}/hub.log" 2>&1 8>&- 9>&- &
+	echo $! >"${STATE_DIR}/events-hub.pid"
+	sleep 1
+	if hub_healthy; then
+		log "vault-events hub running (pid $(events_pids hub | head -n1))"
+		return 0
+	fi
+	log "vault-events hub exited at start; see ${LOG_DIR}/hub.log"
+	return 1
+}
+
+start_events_agent() {
+	if agent_healthy; then
+		return 0
+	fi
+	if [ ! -x "${EVENTS_BIN}" ]; then
+		log "vault-events missing at ${EVENTS_BIN}"
+		return 1
+	fi
+	local vault
+	vault="$(vault_root)"
+	mkdir -p "${EVENTS_SHARE}/agent" "${LOG_DIR}" "${STATE_DIR}"
+	log "starting vault-events agent (vault ${vault})"
+	setsid nohup "${EVENTS_BIN}" agent \
+		--vault "${vault}" \
+		--device "$(events_get VAULT_EVENTS_DEVICE box)" \
+		--state-dir "${EVENTS_SHARE}/agent" \
+		--connect "$(events_get VAULT_EVENTS_CONNECT tcp/127.0.0.1:7447)" \
+		>>"${LOG_DIR}/agent.log" 2>&1 8>&- 9>&- &
+	echo $! >"${STATE_DIR}/events-agent.pid"
+	sleep 1
+	if agent_healthy; then
+		log "vault-events agent running (pid $(events_pids agent | head -n1))"
+		return 0
+	fi
+	log "vault-events agent exited at start; see ${LOG_DIR}/agent.log"
+	return 1
+}
+
+start_events() {
+	events_enabled || return 0
+	start_events_hub || true
+	start_events_agent || true
+}
+
 cmd_once() {
 	mkdir -p "${STATE_DIR}" "${LOG_DIR}"
 	exec 8>"${STATE_DIR}/watchdog-once.lock"
@@ -233,8 +362,9 @@ cmd_once() {
 	fi
 	rotate_logs
 	ensure_hook || true
-	start_embedder
-	start_searchd
+	start_embedder || true
+	start_searchd || true
+	start_events
 }
 
 cmd_status() {
@@ -254,6 +384,15 @@ cmd_status() {
 	printf 'embedder: %s (%s)\n' "${embed}" "${EMBED_URL}"
 	printf 'searchd:  %s (socket %s)\n' "${daemon}" "${SOCK}"
 	printf 'loop:     %s\n' "${loop}"
+	if events_enabled; then
+		local hub="down" agent="down"
+		hub_healthy && hub="up (pid $(events_pids hub | head -n1))"
+		agent_healthy && agent="up (pid $(events_pids agent | head -n1))"
+		[ "$(events_get VAULT_EVENTS_HUB 1)" = "1" ] || hub="not on this host"
+		printf 'events:   hub %s, agent %s\n' "${hub}" "${agent}"
+	else
+		printf 'events:   off (VAULT_EVENTS_ENABLE!=1 in %s)\n' "${EVENTS_CONFIG}"
+	fi
 	if searchd_healthy; then
 		"${SEARCHD}" status --socket "${SOCK}" || true
 	fi

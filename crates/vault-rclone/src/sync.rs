@@ -584,6 +584,11 @@ mod tests {
                     stdout: String::new(),
                     stderr: self.bisync_stderr.clone(),
                 },
+                "copy" => RunOutput {
+                    code: Some(self.bisync_code),
+                    stdout: String::new(),
+                    stderr: self.bisync_stderr.clone(),
+                },
                 "lsf" if self.lsf_ok => ok("Daily/\nInbox.md\n".into()),
                 "lsf" => RunOutput {
                     code: Some(3),
@@ -673,6 +678,55 @@ mod tests {
         let calls = fake.calls.borrow();
         assert_eq!(calls[0][0], "size");
         assert_eq!(calls[1][0], "bisync");
+    }
+
+    #[test]
+    fn backup_is_one_way_copy_update_without_deletes() {
+        let (_d, host, cfg) = setup(3);
+        let fake = Fake::new();
+        let (code, s) = run(|o| backup(&cfg, &host, &fake, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 1, "no size/bisync call: {calls:?}");
+        let argv = &calls[0];
+        assert_eq!(argv[0], "copy");
+        assert_eq!(
+            argv[1],
+            cfg.vault_local.as_ref().unwrap().display().to_string()
+        );
+        assert_eq!(argv[2], "gdrive:Vault");
+        assert!(argv.contains(&"--update".to_string()));
+        assert!(!argv.contains(&"--dry-run".to_string()));
+        for bad in [
+            "sync",
+            "bisync",
+            "--delete-after",
+            "--delete-during",
+            "--resync",
+        ] {
+            assert!(!argv.contains(&bad.to_string()), "{bad} in {argv:?}");
+        }
+        let log = read_log(&cfg);
+        assert!(log.contains("backup start local="), "{log}");
+        assert!(log.contains("end exit=0"), "{log}");
+        drop(calls);
+        let (_, _) = run(|o| backup(&cfg, &host, &fake, true, o));
+        assert!(fake.calls.borrow()[1].contains(&"--dry-run".to_string()));
+    }
+
+    #[test]
+    fn backup_refuses_nearly_empty_local_and_passes_exit_code() {
+        let (_d, host, cfg) = setup(2);
+        let fake = Fake::new();
+        let (code, s) = run(|o| backup(&cfg, &host, &fake, false, o));
+        assert_eq!(code, EXIT_FAIL);
+        assert!(s.contains("below MIN_FILES=3"), "{s}");
+        assert!(fake.calls.borrow().is_empty());
+        let (_d, host, cfg) = setup(3);
+        let mut fake = Fake::new();
+        fake.bisync_code = 5;
+        let (code, _) = run(|o| backup(&cfg, &host, &fake, false, o));
+        assert_eq!(code, 5);
     }
 
     #[test]
