@@ -211,6 +211,40 @@ box hub inbound. Zenoh needs nothing tailnet-specific: a device connects to
 `tcp/<hub-host>.<tailnet>.ts.net:7447`, or the hub connects *out* to a router
 on a tailnet host with `--connect` (Zenoh links are bidirectional once open).
 
+## Shared endpoint list: `app_settings/VaultEvents/endpoints.json`
+
+VaultHome (Kotlin port, pawelkat/VaultHome PR #7) keeps a shared list of Zenoh endpoints in the vault,
+next to `app_settings/GymMonth/`. It is an ordinary vault file, so it travels as `vault/notes/...`
+events and over Drive. This crate does **not** read it yet; the box hub's dial-out list is still
+`VAULT_EVENTS_HUB_CONNECT` (watchdog) / `hub --connect`. Format (schemaVersion 1):
+
+```json
+{
+  "schemaVersion": 1,
+  "source": { "note": "..." },
+  "routers": [
+    { "id": "note4", "endpoint": "tcp/note4.tailf52603.ts.net:7447", "dialable": true, "note": "planned" },
+    { "id": "box", "tailnetName": "grokbot-user-155710816.tailf52603.ts.net", "dialable": false,
+      "note": "box hub: outbound-only, dials routers; not a connect endpoint" }
+  ],
+  "devices": {
+    "s24": { "app": "VaultHome", "mode": "router", "listen": ["tcp/0.0.0.0:7447"],
+             "endpoint": "tcp/pawels-s24-ultra.tailf52603.ts.net:7447",
+             "tailnetName": "pawels-s24-ultra.tailf52603.ts.net", "lastSeen": "2026-11-18T17:00:00Z" }
+  }
+}
+```
+
+- `routers`: hosts that accept connections; `dialable: false` = dial-out only (the box). Written when
+  the file is seeded.
+- `devices`: each device writes only `devices.<device>` and keeps every other key as read.
+  `endpoint` is present only for router/peer devices.
+- A reader's connect list = its own configured endpoints, then dialable `routers[].endpoint`, then
+  other router/peer `devices[].endpoint`; never its own endpoint.
+- A future `hub --connect-from <vault>/app_settings/VaultEvents/endpoints.json` (or the watchdog)
+  would add those endpoints to the hub's dial-out list; until then set `VAULT_EVENTS_HUB_CONNECT`
+  by hand (e.g. `tcp/pawels-s24-ultra.tailf52603.ts.net:7447` when VaultHome runs in Router mode).
+
 ## Tests
 
 - Unit: key encoding (incl. `KeyExpr` validity), wire format and rejection of
