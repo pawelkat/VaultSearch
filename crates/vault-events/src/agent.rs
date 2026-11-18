@@ -344,6 +344,14 @@ impl AgentCore {
     }
 }
 
+/// Watcher events that can change what is on disk. Access events (open,
+/// read, close-without-write) are dropped: the agent's own reads and
+/// directory scans produce them, and feeding them back would keep the
+/// debounce from ever firing.
+pub fn is_change(kind: &notify::EventKind) -> bool {
+    !matches!(kind, notify::EventKind::Access(_))
+}
+
 /// Options for [`run`].
 #[derive(Debug, Clone)]
 pub struct AgentOpts {
@@ -465,6 +473,9 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
     let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
+            if !is_change(&ev.kind) {
+                return;
+            }
             for p in ev.paths {
                 let _ = tx.send(p);
             }
@@ -490,7 +501,9 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
     let mut rescan_tick = tokio::time::interval(opts.rescan_interval);
     rescan_tick.tick().await;
     let mut link_tick = tokio::time::interval(Duration::from_secs(5));
+    tracing::debug!("counting routers");
     let mut routers = net::router_count(&session).await;
+    tracing::debug!("entering event loop ({routers} router links)");
 
     loop {
         let debounce = tokio::time::sleep(opts.debounce);
@@ -515,6 +528,7 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                 core.save_if_dirty()?;
             }
             Some(p) = rx.recv() => {
+                tracing::trace!("watch: {}", p.display());
                 if let Ok(rel) = key::rel_from_fs(&vault, &p) {
                     if !is_ignored(&rel) {
                         if p.is_dir() {
@@ -590,6 +604,23 @@ mod tests {
             AgentState::new(dev, dir),
             None,
         )
+    }
+
+    #[test]
+    fn access_events_are_not_changes() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, EventKind, ModifyKind, RemoveKind,
+        };
+        assert!(!is_change(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!is_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(is_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Any)));
+        assert!(is_change(&EventKind::Remove(RemoveKind::File)));
+        assert!(is_change(&EventKind::Any));
     }
 
     #[test]
