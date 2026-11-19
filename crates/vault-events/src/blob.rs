@@ -150,6 +150,10 @@ pub struct TransferOpts {
     pub backoff: Duration,
     /// Chunk queries in flight per transfer.
     pub in_flight: usize,
+    /// A live blob reference: how long a receiver waits for the hub to
+    /// store the file before pulling from the sending device itself. One
+    /// copy then crosses a slow router hop instead of one per receiver.
+    pub hub_wait: Duration,
 }
 
 impl Default for TransferOpts {
@@ -161,6 +165,7 @@ impl Default for TransferOpts {
             rounds: 8,
             backoff: Duration::from_millis(500),
             in_flight: DEFAULT_IN_FLIGHT,
+            hub_wait: Duration::from_secs(30),
         }
     }
 }

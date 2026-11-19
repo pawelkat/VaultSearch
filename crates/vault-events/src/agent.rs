@@ -666,6 +666,41 @@ impl Link {
     }
 }
 
+/// Wait (up to `wait`) until the hub stores the state of live blob
+/// reference `ev`: its pull is in progress, and pulling from the hub
+/// afterwards keeps a second copy off the sender's (often slow) link.
+/// Returns `false` if the hub did not have it in time; the fetch then asks
+/// the sending device too.
+async fn wait_for_hub(session: &zenoh::Session, ev: &NoteEvent, wait: Duration) -> bool {
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Ok(Some(stored)) =
+            net::fetch_note(session, &ev.stamp.path, Duration::from_secs(3)).await
+        {
+            if stored.stamp.sha256 == ev.stamp.sha256 || stored.stamp.beats(&ev.stamp) {
+                if t0.elapsed() > Duration::from_secs(1) {
+                    tracing::info!(
+                        "hub has {} after {} ms; fetching from the hub",
+                        ev.stamp.path,
+                        t0.elapsed().as_millis()
+                    );
+                }
+                return true;
+            }
+        }
+        if t0.elapsed() >= wait {
+            tracing::info!(
+                "hub has not stored {} after {} s; fetching from {} too",
+                ev.stamp.path,
+                wait.as_secs(),
+                ev.stamp.origin
+            );
+            return false;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 async fn fetch_blob_with(
     src: &ZenohSource,
     partial_dir: &Path,
@@ -934,7 +969,9 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                                 ev.stamp.origin, b.size, b.chunks
                             );
                             let (src, dir, t, tx) = (link.source(&ev.stamp.origin), link.partial_dir.clone(), link.transfer.clone(), fetched_tx.clone());
+                            let session = session.clone();
                             tokio::spawn(async move {
+                                wait_for_hub(&session, &ev, t.hub_wait).await;
                                 let r = match fetch_blob_with(&src, &dir, &t, &ev).await {
                                     Ok(full) => Some(full),
                                     Err(e) => {
