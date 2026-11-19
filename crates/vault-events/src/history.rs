@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ack::AckReceipt;
 use crate::event::{ConflictInfo, NoteEvent, Stamp};
 
 /// Rotate `history.jsonl` past this size (one `.1` kept: ~20 MB total).
@@ -157,6 +158,9 @@ pub struct HistoryReply {
     pub path: String,
     /// Newest first.
     pub entries: Vec<HistoryEntry>,
+    /// Devices that confirmed the current version (ok acks for its sha256).
+    #[serde(default)]
+    pub acks: Vec<AckReceipt>,
 }
 
 #[cfg(test)]

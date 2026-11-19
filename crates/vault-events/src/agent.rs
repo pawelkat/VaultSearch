@@ -19,6 +19,7 @@ use std::time::Duration;
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+use crate::ack::{self, TransferAck};
 use crate::blob::{self, OutgoingCache, TransferOpts, ZenohSource};
 use crate::claims;
 use crate::conflict::{self, Decision};
@@ -761,8 +762,14 @@ async fn publish_all(link: &Link, evs: &[NoteEvent]) {
             }
             None => (ev.clone(), String::new()),
         };
+        let t0 = std::time::Instant::now();
         match net::publish(&link.session, &wire).await {
-            Ok(()) => tracing::info!("{}{note}", published_line(ev)),
+            Ok(()) => {
+                tracing::info!("{}{note}", published_line(ev));
+                if let Some(ack) = origin_ack(ev, t0.elapsed().as_millis() as u64) {
+                    publish_ack(&link.session, &link.device, &ev.stamp.sha256, &ack).await;
+                }
+            }
             Err(e) => tracing::warn!("publish {} failed: {e}", ev.stamp.path),
         }
     }
@@ -798,6 +805,59 @@ pub fn published_line(ev: &NoteEvent) -> String {
     )
 }
 
+/// Ack after a receiver has the incoming bytes on disk (Apply or Adopt).
+fn incoming_ack(ev: &NoteEvent, a: &Applied, duration_ms: u64) -> Option<TransferAck> {
+    if ev.stamp.deleted || ev.is_blob_ref() || ev.stamp.sha256.is_empty() {
+        return None;
+    }
+    match &a.decision {
+        Some(Decision::Apply { .. }) | Some(Decision::Adopt) => Some(TransferAck::ok(
+            ev.stamp.path.clone(),
+            ev.size(),
+            duration_ms,
+        )),
+        _ => None,
+    }
+}
+
+/// Origin (or republish) confirmation: this device just published a live file.
+fn origin_ack(ev: &NoteEvent, duration_ms: u64) -> Option<TransferAck> {
+    if ev.stamp.deleted || ev.stamp.sha256.is_empty() {
+        return None;
+    }
+    Some(TransferAck::ok(
+        ev.stamp.path.clone(),
+        ev.size(),
+        duration_ms,
+    ))
+}
+
+async fn publish_ack(session: &zenoh::Session, device: &str, sha256: &str, ack: &TransferAck) {
+    if let Err(e) = ack::publish(session, device, sha256, ack).await {
+        tracing::warn!("ack {} failed: {e}", ack.path);
+    }
+}
+
+async fn ack_incoming(link: &Link, ev: &NoteEvent, a: &Applied, duration_ms: u64) {
+    if let Some(ack) = incoming_ack(ev, a, duration_ms) {
+        publish_ack(&link.session, &link.device, &ev.stamp.sha256, &ack).await;
+    }
+}
+
+async fn ack_fail(link: &Link, ev: &NoteEvent, duration_ms: u64, reason: impl std::fmt::Display) {
+    if ev.stamp.sha256.is_empty() {
+        return;
+    }
+    let bytes = ev.size();
+    let ack = TransferAck::fail(
+        ev.stamp.path.clone(),
+        bytes,
+        duration_ms,
+        reason.to_string(),
+    );
+    publish_ack(&link.session, &link.device, &ev.stamp.sha256, &ack).await;
+}
+
 /// One catch-up pass against the hub. Returns `false` if no hub answered.
 pub async fn catch_up(
     core: &mut AgentCore,
@@ -811,6 +871,7 @@ pub async fn catch_up(
     let (fetch, republish) = core.plan_catchup(&index.stamps);
     let (mut applied, mut conflicts) = (0usize, 0usize);
     for p in &fetch {
+        let t0 = std::time::Instant::now();
         match net::fetch_note(session, p, &link.device, timeout).await? {
             Some(mut ev) => {
                 if ev.is_blob_ref() && core.needs_bytes(&ev) {
@@ -820,6 +881,7 @@ pub async fn catch_up(
                             tracing::warn!(
                                 "catch-up: blob for {p} not fetched: {e}; next pass retries"
                             );
+                            ack_fail(link, &ev, t0.elapsed().as_millis() as u64, e).await;
                             continue;
                         }
                     }
@@ -830,6 +892,7 @@ pub async fn catch_up(
                 }
                 applied += usize::from(a.changed);
                 conflicts += a.conflicts.len();
+                ack_incoming(link, &ev, &a, t0.elapsed().as_millis() as u64).await;
                 publish_all(link, &a.publish).await;
             }
             None => tracing::warn!("catch-up: hub listed {p} but returned nothing"),
@@ -930,7 +993,8 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
         .await?
     };
     // Finished blob fetches: (path+sha, full event if fetched).
-    let (fetched_tx, mut fetched_rx) = mpsc::unbounded_channel::<(String, Option<NoteEvent>)>();
+    let (fetched_tx, mut fetched_rx) =
+        mpsc::unbounded_channel::<(String, Option<NoteEvent>, std::time::Instant)>();
     let mut fetching: HashSet<String> = HashSet::new();
 
     let sub = session
@@ -995,33 +1059,50 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                             );
                             let (src, dir, t, tx) = (link.source(&ev.stamp.origin), link.partial_dir.clone(), link.transfer.clone(), fetched_tx.clone());
                             let (session, device) = (session.clone(), link.device.clone());
+                            let link_session = link.session.clone();
+                            let link_device = link.device.clone();
+                            let t0 = std::time::Instant::now();
                             tokio::spawn(async move {
                                 wait_for_hub(&session, &device, &ev, t.hub_wait).await;
                                 let r = match fetch_blob_with(&src, &dir, &t, &ev).await {
                                     Ok(full) => Some(full),
                                     Err(e) => {
                                         tracing::warn!("blob for {} not fetched: {e}; catch-up retries", ev.stamp.path);
+                                        let ack = TransferAck::fail(
+                                            ev.stamp.path.clone(),
+                                            ev.size(),
+                                            t0.elapsed().as_millis() as u64,
+                                            e.to_string(),
+                                        );
+                                        publish_ack(&link_session, &link_device, &ev.stamp.sha256, &ack).await;
                                         None
                                     }
                                 };
-                                let _ = tx.send((id, r));
+                                let _ = tx.send((id, r, t0));
                             });
                         }
                     }
-                    Ok(ev) => match core.on_incoming(&ev) {
-                        Ok(a) => {
-                            if a.changed {
-                                tracing::info!("{}", applied_line(&ev));
+                    Ok(ev) => {
+                        let t0 = std::time::Instant::now();
+                        match core.on_incoming(&ev) {
+                            Ok(a) => {
+                                if a.changed {
+                                    tracing::info!("{}", applied_line(&ev));
+                                }
+                                ack_incoming(&link, &ev, &a, t0.elapsed().as_millis() as u64).await;
+                                publish_all(&link, &a.publish).await;
                             }
-                            publish_all(&link, &a.publish).await;
+                            Err(e) => {
+                                tracing::error!("apply {} failed: {e}", ev.stamp.path);
+                                ack_fail(&link, &ev, t0.elapsed().as_millis() as u64, &e).await;
+                            }
                         }
-                        Err(e) => tracing::error!("apply {} failed: {e}", ev.stamp.path),
                     },
                     Err(e) => tracing::warn!("dropping bad event on {k}: {e}"),
                 }
                 core.save_if_dirty()?;
             }
-            Some((id, done)) = fetched_rx.recv() => {
+            Some((id, done, t0)) = fetched_rx.recv() => {
                 fetching.remove(&id);
                 if let Some(ev) = done {
                     match core.on_incoming(&ev) {
@@ -1029,9 +1110,13 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                             if a.changed {
                                 tracing::info!("{}", applied_line(&ev));
                             }
+                            ack_incoming(&link, &ev, &a, t0.elapsed().as_millis() as u64).await;
                             publish_all(&link, &a.publish).await;
                         }
-                        Err(e) => tracing::error!("apply {} failed: {e}", ev.stamp.path),
+                        Err(e) => {
+                            tracing::error!("apply {} failed: {e}", ev.stamp.path);
+                            ack_fail(&link, &ev, t0.elapsed().as_millis() as u64, &e).await;
+                        }
                     }
                     core.save_if_dirty()?;
                 }

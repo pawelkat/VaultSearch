@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::io::Read;
 
-use vault_events::{agent, blob, claims, event, hub, key, net, presence, vault};
+use vault_events::{ack, agent, blob, claims, event, hub, key, net, presence, vault};
 
 #[derive(Parser)]
 #[command(
@@ -147,7 +147,8 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         wait_secs: u64,
     },
-    /// Provenance history of one path from the hub (newest first).
+    /// Provenance history of one path from the hub (newest first),
+    /// then the devices that confirmed the current version.
     Who {
         path: String,
         #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
@@ -555,6 +556,9 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             for e in &r.entries {
                 println!("{}", who_line(e));
             }
+            for line in who_ack_lines(&r) {
+                println!("{line}");
+            }
             Ok(())
         }
         Cmd::Peers { connect, device } => {
@@ -665,6 +669,36 @@ fn fmt_dur(ms: u64) -> String {
         60..=3599 => format!("{}m{:02}s", s / 60, s % 60),
         _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
     }
+}
+
+fn who_ack_lines(r: &vault_events::history::HistoryReply) -> Vec<String> {
+    let current = r.entries.iter().find(|e| !e.deleted);
+    let Some(cur) = current else {
+        if r.entries.first().is_some_and(|e| e.deleted) {
+            return vec!["current version is a delete; no content confirmations".to_string()];
+        }
+        return Vec::new();
+    };
+    if r.acks.is_empty() {
+        return vec![format!(
+            "confirmed by 0 device(s) (current sha {}): none yet",
+            short(&cur.sha256)
+        )];
+    }
+    let mut lines = vec![format!(
+        "confirmed by {} device(s) (current sha {}):",
+        r.acks.len(),
+        short(&cur.sha256)
+    )];
+    for a in &r.acks {
+        lines.push(format!(
+            "  {}  {} in {}",
+            a.device,
+            a.status.as_str(),
+            ack::fmt_secs(a.duration_ms)
+        ));
+    }
+    lines
 }
 
 fn who_line(e: &vault_events::history::HistoryEntry) -> String {

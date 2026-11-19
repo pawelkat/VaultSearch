@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use zenoh::key_expr::KeyExpr;
 
+use crate::ack::{self, AckReceipt, AckStore, TransferAck};
 use crate::blob::{self, TransferOpts, ZenohSource};
 use crate::event::{now_ms, NoteEvent};
 use crate::history::{History, HistoryEntry, HistoryReply};
@@ -106,6 +107,9 @@ pub async fn run(
         opts.name,
         history.file().display()
     );
+    let acks = Arc::new(Mutex::new(AckStore::open(&opts.data_dir)?));
+    let ack_file = acks.lock().await.file().to_path_buf();
+    tracing::info!("hub {}: transfer acks in {}", opts.name, ack_file.display());
     let session = zenoh::open(net::router_config(&opts.listen, &opts.connect)?).await?;
     tracing::info!(
         "hub router {} listening on {:?}",
@@ -159,6 +163,7 @@ pub async fn run(
         .declare_queryable(presence::HUB_PRESENCE_KEY)
         .complete(true)
         .await?;
+    let ack_sub = session.declare_subscriber(ack::ACK_WILDCARD).await?;
     let mut registry = presence::Registry::default();
     let (info_tx, mut info_rx) = mpsc::unbounded_channel::<presence::PresenceInfo>();
     let mut online_tick = tokio::time::interval_at(
@@ -325,12 +330,37 @@ pub async fn run(
                                 Vec::new()
                             }
                         };
-                        let body = HistoryReply { format: 1, hub: opts.name.clone(), path, entries };
+                        let current_sha = {
+                            let s = store.lock().await;
+                            s.stamp(&path).and_then(|st| {
+                                if st.deleted { None } else { Some(st.sha256.clone()) }
+                            })
+                        };
+                        let ack_list = match current_sha {
+                            Some(sha) => acks.lock().await.confirmed(&sha),
+                            None => Vec::new(),
+                        };
+                        let body = HistoryReply { format: 1, hub: opts.name.clone(), path, entries, acks: ack_list };
                         if let Err(e) = query.reply(qk.as_str(), serde_json::to_vec(&body)?).await {
                             tracing::warn!("history reply failed: {e}");
                         }
                     }
                     Err(e) => tracing::debug!("history query on {qk} ignored: {e}"),
+                }
+            }
+            s = ack_sub.recv_async() => {
+                let Ok(sample) = s else { break };
+                let k = sample.key_expr().as_str().to_string();
+                match (ack::parse_ack_key(&k), serde_json::from_slice::<TransferAck>(&sample.payload().to_bytes())) {
+                    (Some((sha, dev)), Ok(ack)) => {
+                        tracing::info!("{}", ack::log_line(&dev, &ack));
+                        let receipt = AckReceipt::from_ack(dev, &ack, now_ms());
+                        if let Err(e) = acks.lock().await.record(&sha, receipt) {
+                            tracing::warn!("ack store failed for {k}: {e}");
+                        }
+                    }
+                    (None, _) => tracing::debug!("ignoring ack on unparseable key {k}"),
+                    (_, Err(e)) => tracing::warn!("dropping bad ack on {k}: {e}"),
                 }
             }
             s = presence_sub.recv_async() => {

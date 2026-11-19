@@ -140,8 +140,22 @@ still go out inline (the old behaviour); new hubs and agents accept that.
   the time, path, version, origin, writer, cause, sha256, prev_sha256, the
   sha it replaced, the size, the delete flag and the conflict details.
   `vault-events who <path> [--limit N] [--connect ...]` prints them newest
-  first (Zenoh query `vault/hub/history/<path>?limit=N`). Provenance never
-  goes into note content.
+  first (Zenoh query `vault/hub/history/<path>?limit=N`), then the devices
+  that confirmed the current version. Provenance never goes into note content.
+
+### Transfer acks
+
+After a receiver writes a file (inline or blob) and verifies its SHA-256,
+and after the origin publishes a live file it has on disk, it puts
+`{status: ok|fail, reason?, path, bytes, duration_ms}` on
+`vault/ack/<sha256>/<device>`. The hub subscribes to `vault/ack/**`, logs
+
+    box received Notes/x.md (123) ok in 0.4s
+    s24 received Notes/x.md (123) fail: sha256 mismatch
+
+and keeps the receipts in `<data-dir>/acks.json`. `vault-events who <path>`
+lists the devices that confirmed the current version (ok acks for its
+sha256). Older hubs ignore the key; older agents simply do not publish.
 
 ### Who is asking, who is online
 
@@ -399,7 +413,8 @@ events and over Drive. This crate does **not** read it yet; the box hub's dial-o
   sides, hub restart keeps storage; a 7 MB photo A -> hub -> B in 256 KiB
   chunks (hub stores a small reference + a blob with the right hash, notes
   still sync both ways afterwards, no conflict or partial files), and a late
-  joiner gets it from the hub alone after the sender stopped.
+  joiner gets it from the hub alone after the sender stopped; transfer acks
+  from origin and receiver show up in `who` and survive a hub restart.
 - Unit (blob): chunk math and keys, out-of-order assembly, resume after a
   restart (only missing chunks asked again), hash mismatch -> discard and
   refetch, a source that always lies never yields bytes, outgoing cache

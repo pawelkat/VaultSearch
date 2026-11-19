@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use vault_events::ack::AckStatus;
 use vault_events::{agent, claims, event, hub, net};
 
 fn free_port() -> u16 {
@@ -664,5 +665,84 @@ async fn presence_and_requester_identity() {
     drop(spy);
     s.close().await.unwrap();
     a.stop().await;
+    hub.stop().await;
+}
+
+async fn who_reply(port: u16, path: &str) -> Option<vault_events::history::HistoryReply> {
+    let s = zenoh::open(net::client_config(&[format!("tcp/127.0.0.1:{port}")]).unwrap())
+        .await
+        .unwrap();
+    let r = net::fetch_history(&s, path, 0, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+    s.close().await.unwrap();
+    r
+}
+
+async fn wait_acks(port: u16, path: &str, n: usize) -> vault_events::history::HistoryReply {
+    let t = Instant::now();
+    loop {
+        let r = who_reply(port, path).await;
+        if let Some(r) = r.as_ref() {
+            if r.acks.len() >= n {
+                return r.clone();
+            }
+        }
+        assert!(
+            t.elapsed() < T,
+            "acks for {path} never reached {n}: {:?}",
+            r.as_ref()
+                .map(|r| r.acks.iter().map(|a| a.device.clone()).collect::<Vec<_>>())
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// After A writes a note and B applies it, both devices ack the current
+/// sha256; `who` lists them, and the receipts survive a hub restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_acks_and_who() {
+    let root = tempfile::tempdir().unwrap();
+    let (hub_dir, va, vb, sa, sb) = (
+        root.path().join("hub"),
+        root.path().join("vault-a"),
+        root.path().join("vault-b"),
+        root.path().join("state-a"),
+        root.path().join("state-b"),
+    );
+    std::fs::create_dir_all(va.join("Notes")).unwrap();
+    std::fs::create_dir_all(vb.join("Notes")).unwrap();
+    let port = free_port();
+    let hub = start_hub(&hub_dir, port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let a = start_agent(&va, &sa, "dev-a", port);
+    let b = start_agent(&vb, &sb, "dev-b", port);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let body = "ack me please\n";
+    std::fs::write(va.join("Notes/ack.md"), body).unwrap();
+    wait_for("B has Notes/ack.md", T, || {
+        read(vb.join("Notes/ack.md")).as_deref() == Some(body)
+    })
+    .await;
+
+    let r = wait_acks(port, "Notes/ack.md", 2).await;
+    let mut names: Vec<_> = r.acks.iter().map(|a| a.device.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["dev-a", "dev-b"]);
+    assert!(r.acks.iter().all(|a| a.status == AckStatus::Ok));
+    assert!(r.acks.iter().all(|a| a.path == "Notes/ack.md"));
+    assert!(r.acks.iter().all(|a| a.bytes == body.len() as u64));
+    assert_eq!(r.acks[0].path, r.entries[0].path);
+
+    a.stop().await;
+    b.stop().await;
+    hub.stop().await;
+    let hub = start_hub(&hub_dir, port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let r = who_reply(port, "Notes/ack.md").await.unwrap();
+    let mut names: Vec<_> = r.acks.iter().map(|a| a.device.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["dev-a", "dev-b"], "acks survive hub restart");
     hub.stop().await;
 }
