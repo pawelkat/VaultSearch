@@ -82,6 +82,9 @@ Tombstones are kept in hub storage indefinitely in stage 1.
 
 Regular files up to `--max-bytes` (default 8 MiB). Larger files, symlinks,
 anything under a dot-directory or dotfile (`.obsidian/`, `.trash/`, `.git/`),
+except the `.grok/skills/` allow-list (shared agent skills: every regular file
+under it syncs, but other `.grok/` content and nested dot segments such as
+`.grok/skills/x/.DS_Store` do not; the hub refuses non-synced paths too),
 editor/download temp files (`*.tmp`, `*~`, `*.swp`, `*.part`, ...), and the
 agent's own `.vault-events-tmp-*` files do not. Large attachments stay on the
 Drive fallback path.

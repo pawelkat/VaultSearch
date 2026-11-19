@@ -12,6 +12,7 @@ use crate::event::NoteEvent;
 use crate::key;
 use crate::net::{self, BoxError, IndexReply};
 use crate::store::HubStore;
+use crate::vault::is_synced_path;
 
 #[derive(Debug, Clone)]
 pub struct HubOpts {
@@ -68,6 +69,9 @@ pub async fn run(
                 let Ok(sample) = s else { break };
                 let k = sample.key_expr().as_str().to_string();
                 match NoteEvent::decode(&sample.payload().to_bytes(), Some(&k)) {
+                    Ok(ev) if !is_synced_path(&ev.stamp.path) => {
+                        tracing::debug!("not storing non-synced path {}", ev.stamp.path);
+                    }
                     Ok(ev) => {
                         let stored = store.lock().await.offer(&ev);
                         match stored {

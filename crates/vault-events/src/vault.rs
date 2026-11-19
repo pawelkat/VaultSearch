@@ -36,22 +36,48 @@ impl Disk {
     }
 }
 
-/// Paths that never sync in stage 1: anything under a dot-directory or a
-/// dotfile (`.obsidian/` is per-device UI state, `.trash/`, `.git/`,
-/// sync-tool metadata), editor/download temp files, and our own temp files.
-pub fn is_ignored(rel: &str) -> bool {
-    for comp in rel.split('/') {
-        if comp.starts_with('.') {
-            return true;
+/// The one dot-directory that does sync: shared agent skills
+/// (`.grok/skills/**`, e.g. `SKILL.md`, helper scripts). Everything else
+/// under `.grok/` (auth, config, sessions) stays local.
+pub const SYNCED_DOT_PREFIX: [&str; 2] = [".grok", "skills"];
+
+/// Single source of truth for "does this vault-relative path sync?", used
+/// by the scan, the watcher, publishing, incoming apply, catch-up and the
+/// hub. Never synced: anything under a dot-directory or a dotfile
+/// (`.obsidian/` is per-device UI state, `.trash/`, `.git/`, sync-tool
+/// metadata) except the `.grok/skills/` allow-list, editor/download temp
+/// files, and our own temp files. Inside `.grok/skills/` nested dot
+/// segments (`.grok/skills/a/.DS_Store`, `.grok/skills/.git/...`) are still
+/// excluded.
+pub fn is_synced_path(rel: &str) -> bool {
+    let comps: Vec<&str> = rel.split('/').collect();
+    let allowed = comps.len() > SYNCED_DOT_PREFIX.len() && comps.starts_with(&SYNCED_DOT_PREFIX);
+    for (i, comp) in comps.iter().enumerate() {
+        if comp.starts_with('.') && !(allowed && i < SYNCED_DOT_PREFIX.len()) {
+            return false;
         }
     }
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name.ends_with('~')
+    let name = comps.last().copied().unwrap_or(rel);
+    !(name.ends_with('~')
         || name.starts_with("~$")
         || name.starts_with(".#")
         || [".tmp", ".swp", ".swx", ".part", ".crdownload", ".partial"]
             .iter()
-            .any(|s| name.ends_with(s))
+            .any(|s| name.ends_with(s)))
+}
+
+/// Inverse of [`is_synced_path`].
+pub fn is_ignored(rel: &str) -> bool {
+    !is_synced_path(rel)
+}
+
+/// Whether a directory may hold synced files, so the scan and the watcher
+/// descend into it: synced paths, plus the bare ancestors of the allow-list
+/// (`.grok`, `.grok/skills`).
+pub fn may_contain_synced(rel_dir: &str) -> bool {
+    let comps: Vec<&str> = rel_dir.split('/').collect();
+    is_synced_path(rel_dir)
+        || (comps.len() <= SYNCED_DOT_PREFIX.len() && SYNCED_DOT_PREFIX.starts_with(&comps))
 }
 
 pub fn mtime_ms(md: &fs::Metadata) -> u64 {
@@ -193,12 +219,11 @@ impl VaultFs {
                 let Ok(rel) = key::rel_from_fs(&self.root, &abs) else {
                     continue;
                 };
-                if is_ignored(&rel) {
-                    continue;
-                }
                 if ft.is_dir() {
-                    stack.push(abs);
-                } else if ft.is_file() {
+                    if may_contain_synced(&rel) {
+                        stack.push(abs);
+                    }
+                } else if ft.is_file() && is_synced_path(&rel) {
                     out.push(rel);
                 }
             }
@@ -256,6 +281,70 @@ mod tests {
         assert!(!is_ignored("Notes/a.md"));
         assert!(!is_ignored("Attachments /p.png"));
         assert!(!is_ignored("Notes/note4.md..conflict-Date1"));
+    }
+
+    #[test]
+    fn grok_skills_allow_list() {
+        assert!(is_synced_path(".grok/skills/a/SKILL.md"));
+        assert!(is_synced_path(
+            ".grok/skills/panel-daily/scripts/after-sync.sh"
+        ));
+        assert!(is_synced_path(".grok/skills/vault-sync/scripts/config.env"));
+        assert!(!is_synced_path(".grok/auth.json"));
+        assert!(!is_synced_path(".grok/config"));
+        assert!(!is_synced_path(".grok/sessions/x.md"));
+        assert!(!is_synced_path(".grok/skills"));
+        assert!(!is_synced_path(".grok"));
+        assert!(!is_synced_path(".obsidian/x.md"));
+        assert!(!is_synced_path(".grok/skills/a/.hidden"));
+        assert!(!is_synced_path(".grok/skills/a/.DS_Store"));
+        assert!(!is_synced_path(".grok/skills/.git/config"));
+        assert!(!is_synced_path(".grok/skills/a/SKILL.md.swp"));
+        assert!(
+            !is_synced_path("Notes/.grok/skills/a/SKILL.md"),
+            "only at vault root"
+        );
+        assert!(!is_synced_path(".Grok/skills/a/SKILL.md"));
+        assert!(may_contain_synced(".grok"));
+        assert!(may_contain_synced(".grok/skills"));
+        assert!(may_contain_synced(".grok/skills/a"));
+        assert!(!may_contain_synced(".grok/sessions"));
+        assert!(!may_contain_synced(".obsidian"));
+        assert!(!may_contain_synced(".grok/skills/.git"));
+    }
+
+    #[test]
+    fn scan_includes_grok_skills_only() {
+        let t = tempfile::tempdir().unwrap();
+        let v = VaultFs::new(t.path(), 100);
+        for p in [
+            ".grok/skills/a/SKILL.md",
+            ".grok/skills/a/scripts/run.sh",
+            ".grok/skills/a/.hidden",
+            ".grok/skills/.git/HEAD",
+            ".grok/auth.json",
+            ".grok/config/x.md",
+            ".obsidian/x.md",
+            "Notes/n.md",
+        ] {
+            v.write_atomic(p, b"x").unwrap();
+        }
+        assert_eq!(
+            v.scan().unwrap(),
+            vec![
+                ".grok/skills/a/SKILL.md".to_string(),
+                ".grok/skills/a/scripts/run.sh".to_string(),
+                "Notes/n.md".to_string(),
+            ]
+        );
+        assert!(matches!(
+            v.read(".grok/auth.json").unwrap(),
+            Disk::Skipped(_)
+        ));
+        assert!(matches!(
+            v.read(".grok/skills/a/SKILL.md").unwrap(),
+            Disk::Present { .. }
+        ));
     }
 
     #[test]

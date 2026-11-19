@@ -23,7 +23,7 @@ use crate::event::{now_ms, NoteEvent, Stamp};
 use crate::key;
 use crate::net;
 use crate::state::AgentState;
-use crate::vault::{is_ignored, Disk, VaultFs};
+use crate::vault::{is_synced_path, may_contain_synced, Disk, VaultFs};
 
 pub const DEFAULT_MAX_DELETE: usize = 50;
 pub const DEFAULT_MIN_FILES: usize = 3;
@@ -91,7 +91,7 @@ impl AgentCore {
     pub fn on_incoming(&mut self, ev: &NoteEvent) -> io::Result<Applied> {
         let path = ev.stamp.path.clone();
         let mut out = Applied::default();
-        if is_ignored(&path) {
+        if !is_synced_path(&path) {
             tracing::debug!("ignoring event for ignored path {path}");
             return Ok(out);
         }
@@ -172,7 +172,7 @@ impl AgentCore {
     /// same-size saves inside the filesystem's mtime granularity look
     /// identical by stat alone).
     fn local_change(&mut self, rel: &str, trust_stat: bool) -> io::Result<Option<NoteEvent>> {
-        if is_ignored(rel) || key::validate_rel(rel).is_err() {
+        if !is_synced_path(rel) || key::validate_rel(rel).is_err() {
             return Ok(None);
         }
         let entry = self.state.entries.get(rel).cloned();
@@ -299,7 +299,7 @@ impl AgentCore {
         let hub_map: BTreeMap<&str, &Stamp> = hub.iter().map(|s| (s.path.as_str(), s)).collect();
         let mut fetch = Vec::new();
         for s in hub {
-            if is_ignored(&s.path) {
+            if !is_synced_path(&s.path) {
                 continue;
             }
             match self.state.stamp(&s.path) {
@@ -530,11 +530,18 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
             Some(p) = rx.recv() => {
                 tracing::trace!("watch: {}", p.display());
                 if let Ok(rel) = key::rel_from_fs(&vault, &p) {
-                    if !is_ignored(&rel) {
+                    // `may_contain_synced` also covers `.grok` / `.grok/skills`
+                        // themselves, so moving or deleting them is seen.
+                    if may_contain_synced(&rel) {
                         if p.is_dir() {
                             // Directory created / moved in: look at its files.
+                            // The sub-scan sees paths relative to `p`, so
+                            // re-check the full path against the allow-list.
                             if let Ok(files) = VaultFs::new(&p, opts.max_bytes).scan() {
-                                for f in files { pending.insert(format!("{rel}/{f}")); }
+                                for f in files {
+                                    let full = format!("{rel}/{f}");
+                                    if is_synced_path(&full) { pending.insert(full); }
+                                }
                             }
                         }
                         // Directory removed / moved out: tracked children.
@@ -735,6 +742,56 @@ mod tests {
         assert_eq!(std::fs::read(a.path().join("a.md")).unwrap(), b"theirs");
         assert_eq!(r.publish.len(), 1, "conflict copy goes out as a new note");
         assert_eq!(r.publish[0].stamp.path, *cp);
+    }
+
+    #[test]
+    fn applies_incoming_grok_skills_and_publishes_local_ones() {
+        let a = tempfile::tempdir().unwrap();
+        let mut c = core(a.path(), "box");
+        let ev = NoteEvent::put(
+            ".grok/skills/a/SKILL.md",
+            b"# skill".to_vec(),
+            "towerx",
+            1,
+            None,
+            1,
+        );
+        let r = c.on_incoming(&ev).unwrap();
+        assert!(r.changed);
+        assert_eq!(
+            std::fs::read(a.path().join(".grok/skills/a/SKILL.md")).unwrap(),
+            b"# skill"
+        );
+        // Local helper script under the allow-list is published; secrets
+        // elsewhere under .grok are not.
+        c.fs.write_atomic(".grok/skills/a/run.sh", b"echo").unwrap();
+        c.fs.write_atomic(".grok/auth.json", b"{}").unwrap();
+        c.fs.write_atomic(".grok/skills/a/.hidden", b"x").unwrap();
+        let b = c.scan().unwrap();
+        let paths: Vec<&str> = b.publish.iter().map(|e| e.stamp.path.as_str()).collect();
+        assert_eq!(paths, vec![".grok/skills/a/run.sh"]);
+        assert_eq!(c.on_local(".grok/auth.json").unwrap(), None);
+        // Catch-up fetches allowed dot paths, skips the rest.
+        let other = NoteEvent::put(".grok/auth.json", b"{}".to_vec(), "s24", 1, None, 1);
+        let skill = NoteEvent::put(".grok/skills/b/SKILL.md", b"b".to_vec(), "s24", 1, None, 1);
+        let (fetch, _) = c.plan_catchup(&[other.stamp.clone(), skill.stamp.clone()]);
+        assert_eq!(fetch, vec![".grok/skills/b/SKILL.md".to_string()]);
+    }
+
+    #[test]
+    fn refuses_incoming_non_allow_listed_dot_paths() {
+        let a = tempfile::tempdir().unwrap();
+        let mut c = core(a.path(), "box");
+        for p in [
+            ".obsidian/x.md",
+            ".grok/auth.json",
+            ".grok/config",
+            ".grok/skills/a/.hidden",
+        ] {
+            let ev = NoteEvent::put(p, b"x".to_vec(), "s24", 1, None, 1);
+            assert_eq!(c.on_incoming(&ev).unwrap(), Applied::default(), "{p}");
+            assert!(!a.path().join(p).exists(), "{p}");
+        }
     }
 
     #[test]

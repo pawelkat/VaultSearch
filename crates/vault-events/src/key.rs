@@ -147,6 +147,8 @@ mod tests {
             "Daily/2026-11-18.md",
             "Notes/C# and $HOME ?*%.md",
             "Notes/Zürich ✓.md",
+            ".grok/skills/vault-search/SKILL.md",
+            ".grok/skills/panel-daily/scripts/after-sync.sh",
             "a",
         ] {
             let k = path_to_key(p).unwrap();
