@@ -672,13 +672,12 @@ fn fmt_dur(ms: u64) -> String {
 }
 
 fn who_ack_lines(r: &vault_events::history::HistoryReply) -> Vec<String> {
-    let current = r.entries.iter().find(|e| !e.deleted);
-    let Some(cur) = current else {
-        if r.entries.first().is_some_and(|e| e.deleted) {
-            return vec!["current version is a delete; no content confirmations".to_string()];
-        }
+    let Some(cur) = r.entries.first() else {
         return Vec::new();
     };
+    if cur.deleted {
+        return vec!["current version is a delete; no content confirmations".to_string()];
+    }
     if r.acks.is_empty() {
         return vec![format!(
             "confirmed by 0 device(s) (current sha {}): none yet",
