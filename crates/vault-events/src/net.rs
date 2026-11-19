@@ -9,6 +9,7 @@ use zenoh::sample::Locality;
 use zenoh::{Config, Session};
 
 use crate::event::{NoteEvent, Stamp};
+use crate::history::HistoryReply;
 use crate::key;
 
 pub const DEFAULT_PORT: u16 = 7447;
@@ -120,6 +121,31 @@ pub async fn fetch_note(
         }
     }
     Ok(best)
+}
+
+/// Ask the hub for the provenance history of `path` (newest first).
+/// `Ok(None)` = no hub answered.
+pub async fn fetch_history(
+    session: &Session,
+    path: &str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Option<HistoryReply>, BoxError> {
+    let k = key::path_to_history_key(path)?;
+    let replies = session
+        .get(format!("{k}?limit={limit}"))
+        .target(QueryTarget::All)
+        .consolidation(ConsolidationMode::None)
+        .allowed_destination(Locality::Remote)
+        .timeout(timeout)
+        .await?;
+    while let Ok(reply) = replies.recv_async().await {
+        if let Ok(sample) = reply.result() {
+            let r: HistoryReply = serde_json::from_slice(&sample.payload().to_bytes())?;
+            return Ok(Some(r));
+        }
+    }
+    Ok(None)
 }
 
 /// Number of routers this session is connected to right now.

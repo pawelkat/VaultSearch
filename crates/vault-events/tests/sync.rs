@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use vault_events::{agent, hub, net};
+use vault_events::{agent, claims, event, hub, net};
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -46,6 +46,16 @@ fn start_hub(data: &Path, port: u16) -> Running {
 }
 
 fn start_agent(vault: &Path, state: &Path, device: &str, port: u16) -> Running {
+    start_agent_with(vault, state, device, port, None)
+}
+
+fn start_agent_with(
+    vault: &Path,
+    state: &Path,
+    device: &str,
+    port: u16,
+    bisync_marker_dir: Option<PathBuf>,
+) -> Running {
     let (tx, rx) = watch::channel(false);
     let opts = agent::AgentOpts {
         vault: vault.to_path_buf(),
@@ -59,6 +69,8 @@ fn start_agent(vault: &Path, state: &Path, device: &str, port: u16) -> Running {
         catchup_interval: Duration::from_secs(3),
         rescan_interval: Duration::from_secs(4),
         query_timeout: Duration::from_secs(5),
+        program: agent::DEFAULT_PROGRAM.into(),
+        bisync_marker_dir,
     };
     let task = tokio::spawn(async move {
         agent::run(opts, Some(rx)).await.expect("agent");
@@ -237,5 +249,106 @@ async fn hub_and_two_agents() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(hub_version(port, "Notes/shared.md").await, Some(2));
     assert_eq!(hub_version(port, "Notes/x.md").await, Some(3));
+    hub.stop().await;
+}
+
+async fn history(port: u16, path: &str) -> Vec<vault_events::history::HistoryEntry> {
+    let s = zenoh::open(net::client_config(&[format!("tcp/127.0.0.1:{port}")]).unwrap())
+        .await
+        .unwrap();
+    let r = net::fetch_history(&s, path, 0, Duration::from_secs(5))
+        .await
+        .unwrap();
+    s.close().await.unwrap();
+    r.map(|r| r.entries).unwrap_or_default()
+}
+
+async fn wait_history(port: u16, path: &str, n: usize) -> Vec<vault_events::history::HistoryEntry> {
+    let t = Instant::now();
+    loop {
+        let h = history(port, path).await;
+        if h.len() >= n {
+            return h;
+        }
+        assert!(
+            t.elapsed() < T,
+            "history of {path} never reached {n}: {h:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_cause_and_history() {
+    let root = tempfile::tempdir().unwrap();
+    let (hub_dir, va, sa, marker) = (
+        root.path().join("hub"),
+        root.path().join("vault-a"),
+        root.path().join("state-a"),
+        root.path().join("vault-rclone"),
+    );
+    std::fs::create_dir_all(va.join("Notes")).unwrap();
+    std::fs::create_dir_all(&marker).unwrap();
+    let port = free_port();
+    let hub = start_hub(&hub_dir, port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let a = start_agent_with(&va, &sa, "dev-a", port, Some(marker.clone()));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // 1. An unknown program edits the note: dev-a/external.
+    std::fs::write(va.join("Notes/w.md"), "v1\n").unwrap();
+    let h = wait_history(port, "Notes/w.md", 1).await;
+    assert_eq!(h[0].writer.as_deref(), Some("dev-a/external"));
+    assert_eq!(h[0].cause.as_deref(), Some("external-edit"));
+    assert_eq!(h[0].size, 3);
+
+    // 2. While vault-rclone's marker says bisync runs: dev-a/bisync.
+    let m = vault_rclone::marker::SyncMarker::start(&marker, "sync");
+    std::fs::write(va.join("Notes/w.md"), "from drive\n").unwrap();
+    let h = wait_history(port, "Notes/w.md", 2).await;
+    assert_eq!(h[0].writer.as_deref(), Some("dev-a/bisync"));
+    assert_eq!(h[0].cause.as_deref(), Some("bisync-pull"));
+    drop(m);
+    // Past the 5 s window, edits are external again.
+    tokio::time::sleep(Duration::from_millis(agent::BISYNC_WINDOW_MS + 500)).await;
+
+    // 3. A claimed write (what `vault-events write --as galanonim` does).
+    let body = b"by the journalist\n";
+    claims::put(
+        &claims::claims_dir(&sa),
+        &claims::Claim {
+            path: "Notes/w.md".into(),
+            sha256: event::sha256_hex(body),
+            writer: "galanonim".into(),
+            ts_ms: event::now_ms(),
+        },
+    )
+    .unwrap();
+    std::fs::write(va.join("Notes/w.md"), body).unwrap();
+    let h = wait_history(port, "Notes/w.md", 3).await;
+    assert_eq!(h[0].writer.as_deref(), Some("dev-a/galanonim"));
+    assert_eq!(h[0].cause.as_deref(), Some("local-edit"));
+    // Newest first, each entry links to the one it replaced.
+    assert_eq!(
+        h.iter().map(|e| e.version).collect::<Vec<_>>(),
+        vec![3, 2, 1]
+    );
+    assert_eq!(h[0].replaced_sha256.as_deref(), Some(h[1].sha256.as_str()));
+    assert_eq!(h[0].prev_sha256.as_deref(), Some(h[1].sha256.as_str()));
+    assert_eq!(h[2].replaced_sha256, None);
+
+    // 4. rclone bisync conflict files are never published or stored.
+    std::fs::write(va.join("Notes/w.md..conflict-Date1"), "old\n").unwrap();
+    std::fs::write(va.join("Notes/after.md"), "x\n").unwrap();
+    wait_history(port, "Notes/after.md", 1).await;
+    assert!(history(port, "Notes/w.md..conflict-Date1").await.is_empty());
+    assert_eq!(hub_version(port, "Notes/w.md..conflict-Date1").await, None);
+
+    // 5. History survives a hub restart (append-only file).
+    a.stop().await;
+    hub.stop().await;
+    let hub = start_hub(&hub_dir, port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(history(port, "Notes/w.md").await.len(), 3);
     hub.stop().await;
 }

@@ -50,7 +50,36 @@ Payload: JSON.
 | `deleted` | Tombstone. No `content`, empty `sha256`. |
 | `sha256` | Hex SHA-256 of the content; verified on decode. |
 | `prev_sha256` | SHA-256 the edit was based on (absent for a note the device had never seen). Distinguishes a fast-forward from a concurrent edit. |
+| `writer` | Optional. Who wrote this state, `<device>/<program>`: `box/agent` (the agent's own conflict copies), `box/bisync` (rclone bisync pulled it from Drive), `box/galanonim` (a bot via `vault-events write --as`), `s24/vaulthome`, `<device>/external` (an editor or tool the agent does not know). Debug only, never part of the ordering. |
+| `cause` | Optional. `local-edit`, `external-edit`, `bisync-pull`, `event-apply-republish`, `conflict-copy`, `delete`, `catchup-republish`, `seed`. |
 | `content` | File bytes, base64. |
+| `conflict` | Optional, conflict copies only: `{of, winner_sha256, winner_size, winner_origin, loser_sha256, loser_size, loser_origin}`. |
+
+`writer`, `cause` and `conflict` are new optional fields in format 1: older
+builds ignore them and events without them still decode (`-` in logs).
+
+### Who wrote it
+
+- The agent labels a change it sees on disk. A claim left by
+  `vault-events write --as <name> <path> < content` (or `--delete`) makes it
+  `<device>/<name>`. While vault-rclone's bisync runs, and for 5 s after,
+  it is `<device>/bisync` (`bisync-pull`). vault-rclone writes
+  `~/.local/share/vault-rclone/sync.running` (`{pid, start_ms, run}`) for
+  the length of each non-dry-run bisync and `sync.last` when it ends. A
+  `sync.running` whose pid is dead is ignored. Anything else is
+  `<device>/external`.
+- Hub log: `stored <path> vN from <origin> by <writer> (<cause>)`. The agent
+  logs `published ... by ...`, `applied ... from ... by ...` and every
+  conflict with both sides' sizes and hashes. A conflict that keeps the
+  smaller side at the live path logs a WARN on the agent and on the hub.
+- `vault-events index` prints `path version origin writer cause sha256`.
+- The hub appends every stored event to `<data-dir>/history.jsonl`, rotated
+  to `history.jsonl.1` at 10 MiB, so about 20 MiB at most. Each line holds
+  the time, path, version, origin, writer, cause, sha256, prev_sha256, the
+  sha it replaced, the size, the delete flag and the conflict details.
+  `vault-events who <path> [--limit N] [--connect ...]` prints them newest
+  first (Zenoh query `vault/hub/history/<path>?limit=N`). Provenance never
+  goes into note content.
 
 ### Winner and conflict copies
 
@@ -85,8 +114,12 @@ anything under a dot-directory or dotfile (`.obsidian/`, `.trash/`, `.git/`),
 except the `.grok/skills/` allow-list (shared agent skills: every regular file
 under it syncs, but other `.grok/` content and nested dot segments such as
 `.grok/skills/x/.DS_Store` do not; the hub refuses non-synced paths too),
-editor/download temp files (`*.tmp`, `*~`, `*.swp`, `*.part`, ...), and the
-agent's own `.vault-events-tmp-*` files do not. Large attachments stay on the
+editor/download temp files (`*.tmp`, `*~`, `*.swp`, `*.part`, ...), rclone
+bisync's own conflict losers (`*.conflict-*`, `*..conflict-*`, `*.conflictN`;
+each bisync device makes its own, and syncing them spread them to every
+device), and the agent's own `.vault-events-tmp-*` files do not. The agent's
+own `(conflict <origin> <date>)` copies do sync. A conflict copy is never
+made when both sides hold the same bytes. Large attachments stay on the
 Drive fallback path.
 
 ## Hub

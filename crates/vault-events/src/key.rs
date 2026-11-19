@@ -15,6 +15,10 @@ pub const NOTES_PREFIX: &str = "vault/notes";
 pub const NOTES_WILDCARD: &str = "vault/notes/**";
 /// Hub queryable that answers with the compact list of stored stamps.
 pub const INDEX_KEY: &str = "vault/hub/index";
+/// Prefix of the hub's per-path provenance history queryable.
+pub const HISTORY_PREFIX: &str = "vault/hub/history";
+/// Wildcard the hub declares for history queries.
+pub const HISTORY_WILDCARD: &str = "vault/hub/history/**";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
@@ -134,6 +138,22 @@ pub fn key_to_path(key: &str) -> Result<String, PathError> {
     Ok(s)
 }
 
+/// `Daily/a #1.md` -> `vault/hub/history/Daily/a %231.md` (same escaping as
+/// [`path_to_key`]).
+pub fn path_to_history_key(path: &str) -> Result<String, PathError> {
+    let k = path_to_key(path)?;
+    Ok(format!("{HISTORY_PREFIX}{}", &k[NOTES_PREFIX.len()..]))
+}
+
+/// Inverse of [`path_to_history_key`].
+pub fn history_key_to_path(key: &str) -> Result<String, PathError> {
+    let rest = key
+        .strip_prefix(HISTORY_PREFIX)
+        .filter(|r| r.starts_with('/'))
+        .ok_or(PathError::NotANoteKey)?;
+    key_to_path(&format!("{NOTES_PREFIX}{rest}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +194,22 @@ mod tests {
         assert_eq!(key_to_path("vault/notes/x%2"), Err(PathError::BadEscape));
         assert_eq!(key_to_path("vault/notes/a%2Fb"), Err(PathError::BadEscape));
         assert_eq!(key_to_path("vault/notes/%61"), Err(PathError::BadEscape));
+    }
+
+    #[test]
+    fn history_keys_roundtrip() {
+        for p in ["Daily/2026-11-19.md", "Notes/C# and $HOME ?*%.md", "a"] {
+            let k = path_to_history_key(p).unwrap();
+            assert!(k.starts_with("vault/hub/history/"), "{k}");
+            KeyExpr::try_from(k.clone()).unwrap();
+            assert!(KeyExpr::try_from(HISTORY_WILDCARD)
+                .unwrap()
+                .intersects(&KeyExpr::try_from(k.clone()).unwrap()));
+            assert_eq!(history_key_to_path(&k).unwrap(), p);
+        }
+        assert!(history_key_to_path("vault/hub/historyX/a").is_err());
+        assert!(history_key_to_path("vault/notes/a").is_err());
+        assert!(history_key_to_path("vault/hub/history/..%2Fx").is_err());
     }
 
     #[test]

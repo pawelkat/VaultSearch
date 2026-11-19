@@ -440,6 +440,11 @@ fn run_bisync(
         );
     }
 
+    // Tell other programs (the vault-events agent) that file changes in
+    // VAULT_LOCAL from now until shortly after the run come from Drive.
+    // Skipped on --dry-run: nothing is written then.
+    let _marker =
+        (!dry_run).then(|| crate::marker::SyncMarker::start(&crate::marker::marker_dir(cfg), name));
     let opts = BisyncOpts {
         resync,
         dry_run,
@@ -641,6 +646,63 @@ mod tests {
         for needle in [SECRET, "access_token", "refresh_token"] {
             assert!(!s.contains(needle), "leaked {needle:?} in:\n{s}");
         }
+    }
+
+    /// Records whether `sync.running` existed when bisync was spawned.
+    struct MarkerProbe {
+        inner: Fake,
+        dir: PathBuf,
+        seen: RefCell<Option<bool>>,
+    }
+    impl CommandRunner for MarkerProbe {
+        fn run(&self, p: &Path, args: &[String]) -> Result<RunOutput, Error> {
+            if args[0] == "bisync" {
+                *self.seen.borrow_mut() = Some(self.dir.join(crate::marker::RUNNING_FILE).exists());
+            }
+            self.inner.run(p, args)
+        }
+    }
+
+    #[test]
+    fn bisync_runs_under_marker_and_leaves_last() {
+        let (_d, host, cfg) = setup(3);
+        let dir = crate::marker::marker_dir(&cfg);
+        let probe = MarkerProbe {
+            inner: Fake::new(),
+            dir: dir.clone(),
+            seen: RefCell::new(None),
+        };
+        let (code, s) = run(|o| sync(&cfg, &host, &probe, &NoDaemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert_eq!(
+            *probe.seen.borrow(),
+            Some(true),
+            "marker present during bisync"
+        );
+        assert!(!dir.join(crate::marker::RUNNING_FILE).exists());
+        assert!(dir.join(crate::marker::LAST_FILE).exists());
+        // A failing bisync also clears the marker.
+        let mut fail = Fake::new();
+        fail.bisync_code = 2;
+        let probe = MarkerProbe {
+            inner: fail,
+            dir: dir.clone(),
+            seen: RefCell::new(None),
+        };
+        let (code, _) = run(|o| sync(&cfg, &host, &probe, &NoDaemon, false, o));
+        assert_eq!(code, 2);
+        assert_eq!(*probe.seen.borrow(), Some(true));
+        assert!(!dir.join(crate::marker::RUNNING_FILE).exists());
+        // Dry runs write nothing, so no marker.
+        std::fs::remove_file(dir.join(crate::marker::LAST_FILE)).unwrap();
+        let probe = MarkerProbe {
+            inner: Fake::new(),
+            dir: dir.clone(),
+            seen: RefCell::new(None),
+        };
+        let _ = run(|o| sync(&cfg, &host, &probe, &NoDaemon, true, o));
+        assert_eq!(*probe.seen.borrow(), Some(false));
+        assert!(!dir.join(crate::marker::LAST_FILE).exists());
     }
 
     #[test]

@@ -58,12 +58,35 @@ pub fn is_synced_path(rel: &str) -> bool {
         }
     }
     let name = comps.last().copied().unwrap_or(rel);
+    if is_rclone_conflict_artifact(name) {
+        return false;
+    }
     !(name.ends_with('~')
         || name.starts_with("~$")
         || name.starts_with(".#")
         || [".tmp", ".swp", ".swx", ".part", ".crdownload", ".partial"]
             .iter()
             .any(|s| name.ends_with(s)))
+}
+
+/// rclone bisync's own conflict losers: `<name>.conflict-<x>` and
+/// `<name>..conflict-<x>` (`--conflict-suffix conflict-`, e.g.
+/// `2026-11-19.md..conflict-Date1`, `x.md.conflict-2026-11-19`), plus the
+/// older default `<name>.conflict<N>`. Each bisync device makes its own, so
+/// syncing them as notes spreads them to every device; they are never
+/// synced. The agent's own `<name> (conflict <origin> <date>).<ext>` copies
+/// are deliberate and still sync.
+pub fn is_rclone_conflict_artifact(file_name: &str) -> bool {
+    if file_name.contains(".conflict-") {
+        return true;
+    }
+    match file_name.rfind(".conflict") {
+        Some(i) => {
+            let tail = &file_name[i + ".conflict".len()..];
+            !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 /// Inverse of [`is_synced_path`].
@@ -280,7 +303,9 @@ mod tests {
         assert!(is_ignored("Notes/a.md~"));
         assert!(!is_ignored("Notes/a.md"));
         assert!(!is_ignored("Attachments /p.png"));
-        assert!(!is_ignored("Notes/note4.md..conflict-Date1"));
+        // rclone bisync conflict losers stopped syncing (they spread to every
+        // device and came back after each cleanup, 2026-11-19).
+        assert!(is_ignored("Notes/note4.md..conflict-Date1"));
     }
 
     #[test]
@@ -387,5 +412,30 @@ mod tests {
             v.conflict_slot(base, b"y").unwrap().as_deref(),
             Some("a (conflict s24 2026-11-18) 2.md")
         );
+    }
+    #[test]
+    fn rclone_conflict_artifacts_never_sync() {
+        for p in [
+            "Daily/2026-11-19.md..conflict-Date1",
+            "Daily/2026-11-18.md..conflict-Date2",
+            "Notes/x.md.conflict-2026-11-19",
+            "Notes/x.md.conflict-1",
+            "Notes/x.md.conflict1",
+            "Attachments/p.jpg.conflict23",
+            ".grok/skills/a/SKILL.md..conflict-Date1",
+        ] {
+            assert!(!is_synced_path(p), "{p}");
+            assert!(is_ignored(p), "{p}");
+        }
+        for p in [
+            "Daily/2026-11-19 (conflict s24 2026-11-19).md",
+            "Daily/2026-09-19-20260919_153121 (conflict nitro5 2026-11-18).jpg",
+            "Notes/conflict-resolution.md",
+            "Notes/x.conflicts.md",
+            "Notes/a.conflict",
+            "Notes/a.conflictX",
+        ] {
+            assert!(is_synced_path(p), "{p}");
+        }
     }
 }

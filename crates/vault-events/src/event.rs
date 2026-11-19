@@ -40,6 +40,71 @@ pub struct Stamp {
     /// concurrent edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_sha256: Option<String>,
+    /// Who wrote this state, `<device>/<program>` (`box/agent`,
+    /// `box/bisync`, `box/galanonim`, `s24/vaulthome`, `s24/external`).
+    /// Debug provenance only: never part of the ordering. Absent in events
+    /// from older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
+    /// Why this state was produced; one of the [`cause`] constants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+}
+
+/// Values of [`Stamp::cause`].
+pub mod cause {
+    /// A named writer (`vault-events write --as`, the app itself) saved it.
+    pub const LOCAL_EDIT: &str = "local-edit";
+    /// Changed on disk by a program the agent does not know (editor, bot).
+    pub const EXTERNAL_EDIT: &str = "external-edit";
+    /// Written by rclone bisync pulling from Drive (marker seen).
+    pub const BISYNC_PULL: &str = "bisync-pull";
+    /// An applied incoming event published again by a relay.
+    pub const EVENT_APPLY_REPUBLISH: &str = "event-apply-republish";
+    /// The losing side of a conflict, saved under a conflict name.
+    pub const CONFLICT_COPY: &str = "conflict-copy";
+    /// Removed on disk.
+    pub const DELETE: &str = "delete";
+    /// A recorded state the hub lacked, sent again during catch-up.
+    pub const CATCHUP_REPUBLISH: &str = "catchup-republish";
+    /// Found untracked by the first scan of a new agent state.
+    pub const SEED: &str = "seed";
+
+    pub const ALL: [&str; 8] = [
+        LOCAL_EDIT,
+        EXTERNAL_EDIT,
+        BISYNC_PULL,
+        EVENT_APPLY_REPUBLISH,
+        CONFLICT_COPY,
+        DELETE,
+        CATCHUP_REPUBLISH,
+        SEED,
+    ];
+}
+
+/// Details carried by a conflict-copy event: which live path lost, and
+/// both sides' hashes and sizes. Debug provenance only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictInfo {
+    /// Live path the copy was made for.
+    pub of: String,
+    /// The state that stays at the live path.
+    pub winner_sha256: String,
+    pub winner_size: u64,
+    #[serde(default)]
+    pub winner_origin: String,
+    /// The bytes saved in the copy.
+    pub loser_sha256: String,
+    pub loser_size: u64,
+    #[serde(default)]
+    pub loser_origin: String,
+}
+
+impl ConflictInfo {
+    /// The resolution kept the smaller side at the live path.
+    pub fn kept_smaller(&self) -> bool {
+        self.winner_size < self.loser_size
+    }
 }
 
 impl Stamp {
@@ -70,6 +135,16 @@ impl Stamp {
     pub fn same_state(&self, other: &Stamp) -> bool {
         self.rank() == other.rank()
     }
+
+    /// `writer` or `-` (older peers send none).
+    pub fn writer_str(&self) -> &str {
+        self.writer.as_deref().unwrap_or("-")
+    }
+
+    /// `cause` or `-`.
+    pub fn cause_str(&self) -> &str {
+        self.cause.as_deref().unwrap_or("-")
+    }
 }
 
 /// One change, as published on `vault/notes/<path>`.
@@ -81,6 +156,9 @@ pub struct NoteEvent {
     /// File bytes, base64 on the wire. `None` for a tombstone.
     #[serde(default, with = "b64", skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<u8>>,
+    /// Set on conflict-copy events only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<ConflictInfo>,
 }
 
 #[derive(Debug)]
@@ -154,8 +232,11 @@ impl NoteEvent {
                 deleted: false,
                 sha256: sha256_hex(&content),
                 prev_sha256,
+                writer: None,
+                cause: None,
             },
             content: Some(content),
+            conflict: None,
         }
     }
 
@@ -177,9 +258,24 @@ impl NoteEvent {
                 deleted: true,
                 sha256: String::new(),
                 prev_sha256,
+                writer: None,
+                cause: None,
             },
             content: None,
+            conflict: None,
         }
+    }
+
+    /// Same event, labelled with `writer` and `cause`.
+    pub fn by(mut self, writer: &str, cause: &str) -> Self {
+        self.stamp.writer = Some(writer.to_string());
+        self.stamp.cause = Some(cause.to_string());
+        self
+    }
+
+    /// Bytes of the content (0 for a tombstone).
+    pub fn size(&self) -> u64 {
+        self.content.as_ref().map_or(0, |c| c.len() as u64)
     }
 
     pub fn key(&self) -> Result<String, key::PathError> {
@@ -300,6 +396,71 @@ mod tests {
             "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
         );
         assert!(v.get("prev_sha256").is_none());
+    }
+
+    #[test]
+    fn writer_and_cause_roundtrip_and_stay_out_of_ordering() {
+        let e = NoteEvent::put("a.md", b"hi".to_vec(), "box", 1, None, 7)
+            .by("box/galanonim", cause::LOCAL_EDIT);
+        let v: serde_json::Value = serde_json::from_slice(&e.encode()).unwrap();
+        assert_eq!(v["writer"], "box/galanonim");
+        assert_eq!(v["cause"], "local-edit");
+        assert!(v.get("conflict").is_none());
+        let back = NoteEvent::decode(&e.encode(), None).unwrap();
+        assert_eq!(back, e);
+        let plain = NoteEvent::put("a.md", b"hi".to_vec(), "box", 1, None, 7);
+        assert!(plain.stamp.same_state(&e.stamp));
+        assert!(!plain.stamp.beats(&e.stamp) && !e.stamp.beats(&plain.stamp));
+        // Field order on the wire (the Kotlin port encodes byte-identically).
+        let s = String::from_utf8(e.encode()).unwrap();
+        assert!(s.ends_with(
+            r#""sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4","writer":"box/galanonim","cause":"local-edit","content":"aGk="}"#
+        ), "{s}");
+        let mut c = NoteEvent::put(
+            "a (conflict s24 2026-11-18).md",
+            b"x".to_vec(),
+            "box",
+            1,
+            None,
+            7,
+        )
+        .by("box/agent", cause::CONFLICT_COPY);
+        c.conflict = Some(ConflictInfo {
+            of: "a.md".into(),
+            winner_sha256: "w".into(),
+            winner_size: 1,
+            winner_origin: "box".into(),
+            loser_sha256: "l".into(),
+            loser_size: 9,
+            loser_origin: "s24".into(),
+        });
+        let back = NoteEvent::decode(&c.encode(), None).unwrap();
+        assert_eq!(back, c);
+        assert!(back.conflict.unwrap().kept_smaller());
+    }
+
+    #[test]
+    fn decodes_events_from_older_builds() {
+        // Exactly what a pre-writer build (d2537fc) put on the wire.
+        let old = r#"{"format":1,"path":"Daily/2026-11-19.md","version":5,"ts_ms":1763589540000,"origin":"nitro5","deleted":false,"sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4","prev_sha256":"abc","content":"aGk="}"#;
+        let e = NoteEvent::decode(old.as_bytes(), Some("vault/notes/Daily/2026-11-19.md")).unwrap();
+        assert_eq!(e.stamp.writer, None);
+        assert_eq!(e.stamp.cause, None);
+        assert_eq!(e.conflict, None);
+        assert_eq!((e.stamp.writer_str(), e.stamp.cause_str()), ("-", "-"));
+        // And re-encoding an unlabelled event gives the old bytes back.
+        assert_eq!(e.encode(), old.as_bytes());
+        // Unknown future keys are ignored, like the Kotlin reader does.
+        let newer = old.replace(r#""content""#, r#""future":{"x":1},"content""#);
+        assert!(NoteEvent::decode(newer.as_bytes(), None).is_ok());
+        // An old tombstone and an old index stamp.
+        let t = r#"{"format":1,"path":"a.md","version":2,"ts_ms":1,"origin":"s24","deleted":true,"sha256":""}"#;
+        assert!(NoteEvent::decode(t.as_bytes(), None).unwrap().stamp.deleted);
+        let st: Stamp = serde_json::from_str(
+            r#"{"path":"a.md","version":1,"ts_ms":1,"origin":"box","deleted":false,"sha256":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(st.writer, None);
     }
 
     #[test]

@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use zenoh::key_expr::KeyExpr;
 
-use crate::event::NoteEvent;
+use crate::event::{now_ms, NoteEvent};
+use crate::history::{History, HistoryEntry, HistoryReply};
 use crate::key;
 use crate::net::{self, BoxError, IndexReply};
 use crate::store::HubStore;
@@ -43,6 +44,12 @@ pub async fn run(
             opts.data_dir.join("store").display()
         );
     }
+    let history = History::open(&opts.data_dir);
+    tracing::info!(
+        "hub {}: provenance history in {}",
+        opts.name,
+        history.file().display()
+    );
     let session = zenoh::open(net::router_config(&opts.listen, &opts.connect)?).await?;
     tracing::info!(
         "hub router {} listening on {:?}",
@@ -59,6 +66,10 @@ pub async fn run(
         .declare_queryable(key::INDEX_KEY)
         .complete(true)
         .await?;
+    let history_q = session
+        .declare_queryable(key::HISTORY_WILDCARD)
+        .complete(true)
+        .await?;
 
     let mut backup_due: Option<Instant> = None;
     let mut backup_tick = tokio::time::interval(Duration::from_secs(5));
@@ -73,10 +84,27 @@ pub async fn run(
                         tracing::debug!("not storing non-synced path {}", ev.stamp.path);
                     }
                     Ok(ev) => {
-                        let stored = store.lock().await.offer(&ev);
+                        let (stored, replaced) = {
+                            let mut st = store.lock().await;
+                            let replaced = st.stamp(&ev.stamp.path).cloned();
+                            (st.offer(&ev), replaced)
+                        };
                         match stored {
                             Ok(true) => {
-                                tracing::info!("stored {} v{} from {}{}", ev.stamp.path, ev.stamp.version, ev.stamp.origin, if ev.stamp.deleted { " (delete)" } else { "" });
+                                tracing::info!("{}", stored_line(&ev));
+                                if let Some(c) = &ev.conflict {
+                                    if c.kept_smaller() {
+                                        tracing::warn!(
+                                            "conflict on {}: kept the smaller side ({} B {} from {}) at the live path, saved the larger ({} B {} from {}) as {}",
+                                            c.of, c.winner_size, short(&c.winner_sha256), c.winner_origin,
+                                            c.loser_size, short(&c.loser_sha256), c.loser_origin, ev.stamp.path
+                                        );
+                                    }
+                                }
+                                let entry = HistoryEntry::new(&ev, replaced.as_ref(), now_ms());
+                                if let Err(e) = history.append(&entry) {
+                                    tracing::warn!("history append for {} failed: {e}", ev.stamp.path);
+                                }
                                 if opts.backup_config.is_some() && backup_due.is_none() {
                                     backup_due = Some(Instant::now() + opts.backup_interval);
                                 }
@@ -125,6 +153,31 @@ pub async fn run(
                     tracing::warn!("index reply failed: {e}");
                 }
             }
+            q = history_q.recv_async() => {
+                let Ok(query) = q else { break };
+                let qk = query.key_expr().as_str().to_string();
+                let limit: usize = query
+                    .parameters()
+                    .get("limit")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(50);
+                match key::history_key_to_path(&qk) {
+                    Ok(path) => {
+                        let entries = match history.query(&path, limit) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!("history read failed: {e}");
+                                Vec::new()
+                            }
+                        };
+                        let body = HistoryReply { format: 1, hub: opts.name.clone(), path, entries };
+                        if let Err(e) = query.reply(qk.as_str(), serde_json::to_vec(&body)?).await {
+                            tracing::warn!("history reply failed: {e}");
+                        }
+                    }
+                    Err(e) => tracing::debug!("history query on {qk} ignored: {e}"),
+                }
+            }
             _ = backup_tick.tick() => {
                 if let (Some(due), Some(cfg)) = (backup_due, opts.backup_config.clone()) {
                     if Instant::now() >= due {
@@ -152,6 +205,24 @@ pub async fn run(
     Ok(())
 }
 
+fn short(sha: &str) -> &str {
+    &sha[..12.min(sha.len())]
+}
+
+/// `stored <path> vN from <origin> by <writer> (<cause>)[ (delete)]`
+pub fn stored_line(ev: &NoteEvent) -> String {
+    let s = &ev.stamp;
+    format!(
+        "stored {} v{} from {} by {} ({}){}",
+        s.path,
+        s.version,
+        s.origin,
+        s.writer_str(),
+        s.cause_str(),
+        if s.deleted { " (delete)" } else { "" }
+    )
+}
+
 /// One-way `vault-rclone backup` (rclone copy --update, local -> Drive).
 fn run_backup(cfg_file: &std::path::Path, dry_run: bool) -> Result<i32, BoxError> {
     let cfg = vault_rclone::Config::load(Some(cfg_file))?;
@@ -163,4 +234,25 @@ fn run_backup(cfg_file: &std::path::Path, dry_run: bool) -> Result<i32, BoxError
         tracing::info!("{l}");
     }
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::cause;
+
+    #[test]
+    fn stored_line_names_writer_and_cause() {
+        let e = NoteEvent::put("Daily/x.md", b"a".to_vec(), "box", 3, None, 1)
+            .by("box/galanonim", cause::LOCAL_EDIT);
+        assert_eq!(
+            stored_line(&e),
+            "stored Daily/x.md v3 from box by box/galanonim (local-edit)"
+        );
+        let old = NoteEvent::delete("a.md", "s24", 2, None, 1);
+        assert_eq!(
+            stored_line(&old),
+            "stored a.md v2 from s24 by - (-) (delete)"
+        );
+    }
 }

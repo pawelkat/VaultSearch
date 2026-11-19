@@ -14,6 +14,7 @@
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod marker;
 pub mod rclone;
 pub mod reindex;
 pub mod sync;

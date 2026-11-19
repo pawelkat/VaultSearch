@@ -91,6 +91,8 @@ pub fn decide(
             deleted: disk.is_none(),
             sha256: disk.unwrap_or("").to_string(),
             prev_sha256: state_sha.map(str::to_string),
+            writer: None,
+            cause: None,
         };
         if local.beats(incoming) {
             let save_incoming_as = (!incoming.deleted).then(|| conflict_name(incoming));
@@ -404,5 +406,82 @@ mod tests {
                 save_local_as: None
             }
         );
+    }
+
+    #[test]
+    fn equal_content_is_adopted_in_every_branch() {
+        // disk sha == incoming sha => Adopt (when newer) or Ignore, never a
+        // copy, whatever the state says.
+        let h = sha256_hex_s("same");
+        let inc = put("same", "nitro5", 3, Some("other base"), DAY);
+        let states = [
+            None,
+            Some(put("v1", "s24", 1, None, DAY)), // clean-but-diverged
+            Some(put("v2", "s24", 2, Some("v1"), DAY + 10_000)), // dirty tie path
+            Some(NoteEvent::delete("Notes/a.md", "s24", 2, None, DAY).stamp),
+        ];
+        for st in &states {
+            for ts in [DAY - 1, DAY, DAY + 99_999] {
+                let d = decide(st.as_ref(), Some(&h), &inc, "s24", ts);
+                assert_eq!(d, Decision::Adopt, "state {st:?} ts {ts}");
+            }
+        }
+        // Not newer than what we recorded: Ignore, still no copy.
+        let newer = put("x", "s24", 9, None, DAY);
+        assert_eq!(
+            decide(Some(&newer), Some(&h), &inc, "s24", DAY),
+            Decision::Ignore
+        );
+        // Tombstone vs already-absent file.
+        let del = NoteEvent::delete("Notes/a.md", "nitro5", 3, None, DAY).stamp;
+        for st in &states {
+            assert!(matches!(
+                decide(st.as_ref(), None, &del, "s24", DAY),
+                Decision::Adopt | Decision::Ignore
+            ));
+        }
+    }
+
+    #[test]
+    fn no_decision_ever_names_a_copy_of_identical_bytes() {
+        // Exhaustive over small inputs: whenever a copy is requested, the
+        // two sides differ.
+        let contents = ["a", "b"];
+        let mut n = 0;
+        for sc in [None, Some("a"), Some("b")] {
+            for dc in [None, Some("a"), Some("b")] {
+                for ic in [None, Some("a"), Some("b")] {
+                    for (sv, iv) in [(1, 1), (1, 2), (2, 1), (2, 3)] {
+                        for ts in [DAY - 5, DAY, DAY + 5] {
+                            let st = sc.map(|c| put(c, "box", sv, None, DAY));
+                            let disk = dc.map(sha256_hex_s);
+                            let inc = match ic {
+                                Some(c) => put(c, "s24", iv, Some(contents[0]), DAY),
+                                None => NoteEvent::delete("Notes/a.md", "s24", iv, None, DAY).stamp,
+                            };
+                            let inc_sha = ic.map(sha256_hex_s);
+                            match decide(st.as_ref(), disk.as_deref(), &inc, "box", ts) {
+                                Decision::Apply {
+                                    save_local_as: Some(_),
+                                } => {
+                                    assert!(disk.is_some() && disk != inc_sha);
+                                    n += 1;
+                                }
+                                Decision::KeepLocal {
+                                    local,
+                                    save_incoming_as: Some(_),
+                                } => {
+                                    assert!(inc_sha.is_some());
+                                    assert_ne!(Some(local.sha256), inc_sha);
+                                    n += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(n > 0);
     }
 }

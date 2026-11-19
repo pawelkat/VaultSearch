@@ -5,7 +5,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use vault_events::{agent, hub, net, vault};
+use std::io::Read;
+
+use vault_events::{agent, claims, event, hub, key, net, vault};
 
 #[derive(Parser)]
 #[command(
@@ -95,6 +97,48 @@ enum Cmd {
         catchup_secs: u64,
         #[arg(long, default_value_t = 600)]
         rescan_secs: u64,
+        /// Program part of this agent's writer label (`<device>/<program>`).
+        #[arg(long, default_value = agent::DEFAULT_PROGRAM)]
+        program: String,
+        /// vault-rclone marker dir; changes seen while `sync.running` is
+        /// there (or <5 s after) are labelled `<device>/bisync`. Default:
+        /// next to BISYNC_WORKDIR from the vault-rclone config, if that
+        /// config loads.
+        #[arg(long)]
+        bisync_marker_dir: Option<PathBuf>,
+        /// Do not look for a bisync marker (hosts without Drive bisync).
+        #[arg(long)]
+        no_bisync_marker: bool,
+    },
+    /// Write (or delete) one note as a named writer: reads the content from
+    /// stdin, writes it atomically, and leaves a claim so the running agent
+    /// publishes it as `<device>/<name>` (cause local-edit / delete).
+    Write {
+        /// Writer name (`galanonim`). Default: $VAULT_EVENTS_WRITER.
+        #[arg(long = "as", alias = "writer")]
+        as_name: Option<String>,
+        /// Vault-relative path, e.g. `Daily/2026-11-19.md`.
+        path: String,
+        /// Delete the note instead of writing stdin.
+        #[arg(long)]
+        delete: bool,
+        /// Vault root. Default: VAULT_LOCAL from the vault-rclone config.
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Agent state dir (claims live under <state-dir>/claims).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Seconds to wait for the agent to pick the change up (0 = don't).
+        #[arg(long, default_value_t = 10)]
+        wait_secs: u64,
+    },
+    /// Provenance history of one path from the hub (newest first).
+    Who {
+        path: String,
+        #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
+        connect: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Print what the hub stores (path, version, origin) via the index query.
     Index {
@@ -161,12 +205,25 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             debounce_ms,
             catchup_secs,
             rescan_secs,
+            program,
+            bisync_marker_dir,
+            no_bisync_marker,
         } => {
+            if !claims::valid_writer_name(&program) {
+                return Err(format!("--program {program:?}: use [A-Za-z0-9._-], max 32").into());
+            }
+            let rclone_cfg = vault_rclone::Config::load(None).ok();
             let vault = match vault {
                 Some(v) => v,
                 None => vault_rclone::Config::load(None)?
                     .require_local()?
                     .to_path_buf(),
+            };
+            let bisync_marker_dir = if no_bisync_marker {
+                None
+            } else {
+                bisync_marker_dir
+                    .or_else(|| rclone_cfg.as_ref().map(vault_rclone::marker::marker_dir))
             };
             let opts = agent::AgentOpts {
                 vault,
@@ -180,6 +237,8 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 catchup_interval: Duration::from_secs(catchup_secs.max(5)),
                 rescan_interval: Duration::from_secs(rescan_secs.max(5)),
                 query_timeout: Duration::from_secs(20),
+                program,
+                bisync_marker_dir,
             };
             agent::run(opts, None).await
         }
@@ -199,12 +258,15 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 r.stamps.len() - live
             );
             if !summary {
+                println!("# path\tversion\torigin\twriter\tcause\tsha256");
                 for st in &r.stamps {
                     println!(
-                        "{}\tv{}\t{}\t{}",
+                        "{}\tv{}\t{}\t{}\t{}\t{}",
                         st.path,
                         st.version,
                         st.origin,
+                        st.writer_str(),
+                        st.cause_str(),
                         if st.deleted {
                             "deleted"
                         } else {
@@ -215,5 +277,149 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             }
             Ok(())
         }
+        Cmd::Write {
+            as_name,
+            path,
+            delete,
+            vault,
+            state_dir,
+            wait_secs,
+        } => {
+            let name = as_name
+                .or_else(|| std::env::var("VAULT_EVENTS_WRITER").ok())
+                .filter(|s| !s.is_empty())
+                .ok_or("give --as <name> or set VAULT_EVENTS_WRITER")?;
+            if !claims::valid_writer_name(&name) {
+                return Err(format!("writer {name:?}: use [A-Za-z0-9._-], max 32").into());
+            }
+            key::validate_rel(&path).map_err(|e| format!("{path}: {e}"))?;
+            if !vault::is_synced_path(&path) {
+                return Err(format!("{path} is not a synced path").into());
+            }
+            let vault = match vault {
+                Some(v) => v,
+                None => vault_rclone::Config::load(None)?
+                    .require_local()?
+                    .to_path_buf(),
+            };
+            let fs = vault::VaultFs::new(&vault, u64::MAX);
+            let state_dir = state_dir.unwrap_or_else(|| default_share().join("agent"));
+            let dir = claims::claims_dir(&state_dir);
+            let bytes = if delete {
+                None
+            } else {
+                let mut b = Vec::new();
+                std::io::stdin().read_to_end(&mut b)?;
+                Some(b)
+            };
+            let sha = bytes.as_deref().map(event::sha256_hex).unwrap_or_default();
+            claims::put(
+                &dir,
+                &claims::Claim {
+                    path: path.clone(),
+                    sha256: sha.clone(),
+                    writer: name.clone(),
+                    ts_ms: event::now_ms(),
+                },
+            )?;
+            match &bytes {
+                Some(b) => fs.write_atomic(&path, b)?,
+                None => fs.remove(&path)?,
+            }
+            let what = if delete { "deleted" } else { "wrote" };
+            println!(
+                "{what} {path}{} as {name}",
+                bytes
+                    .as_ref()
+                    .map(|b| format!(" ({} B)", b.len()))
+                    .unwrap_or_default()
+            );
+            if wait_secs > 0 {
+                let t = std::time::Instant::now();
+                while t.elapsed() < Duration::from_secs(wait_secs) {
+                    if claims::peek(&dir, &path).is_none() {
+                        println!("agent picked it up (claim consumed)");
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                eprintln!(
+                    "warning: the agent has not picked up {path} within {wait_secs}s (is it running with --state-dir {}?)",
+                    state_dir.display()
+                );
+            }
+            Ok(())
+        }
+        Cmd::Who {
+            path,
+            connect,
+            limit,
+        } => {
+            key::validate_rel(&path).map_err(|e| format!("{path}: {e}"))?;
+            let s = zenoh::open(net::client_config(&connect)?).await?;
+            let r = net::fetch_history(&s, &path, limit, Duration::from_secs(10)).await?;
+            s.close().await?;
+            let Some(r) = r else {
+                return Err("no hub answered vault/hub/history (older hub build?)".into());
+            };
+            println!(
+                "hub {}: {} history entries for {} (newest first)",
+                r.hub,
+                r.entries.len(),
+                r.path
+            );
+            for e in &r.entries {
+                println!("{}", who_line(e));
+            }
+            Ok(())
+        }
     }
+}
+
+fn short(s: &str) -> &str {
+    &s[..12.min(s.len())]
+}
+
+/// `2026-11-19T20:59:41Z v5 nitro5 nitro5/external (external-edit) 2861 B sha 8f4343466 prev 1a2b..`
+fn who_line(e: &vault_events::history::HistoryEntry) -> String {
+    let when = vault_rclone::sync::format_utc(e.stored_ms / 1000);
+    let what = if e.deleted {
+        "deleted".to_string()
+    } else {
+        format!("{} B sha {}", e.size, short(&e.sha256))
+    };
+    let mut line = format!(
+        "{when} v{} from {} by {} ({}) {what}",
+        e.version,
+        e.origin,
+        e.writer.as_deref().unwrap_or("-"),
+        e.cause.as_deref().unwrap_or("-"),
+    );
+    match &e.prev_sha256 {
+        Some(p) => line.push_str(&format!(" based-on {}", short(p))),
+        None => line.push_str(" based-on -"),
+    }
+    match &e.replaced_sha256 {
+        Some(r) if r.is_empty() => line.push_str(" replaced tombstone"),
+        Some(r) => line.push_str(&format!(" replaced {}", short(r))),
+        None => line.push_str(" new-to-hub"),
+    }
+    if let Some(c) = &e.conflict {
+        line.push_str(&format!(
+            " | conflict copy of {}: kept {} B {} ({}), saved {} B {} ({}){}",
+            c.of,
+            c.winner_size,
+            short(&c.winner_sha256),
+            c.winner_origin,
+            c.loser_size,
+            short(&c.loser_sha256),
+            c.loser_origin,
+            if c.kept_smaller() {
+                " WARN kept smaller side"
+            } else {
+                ""
+            }
+        ));
+    }
+    line
 }
