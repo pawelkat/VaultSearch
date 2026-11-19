@@ -465,8 +465,21 @@ impl AgentCore {
     }
 
     /// Given the hub's stamps: which paths to fetch (hub newer or unknown
-    /// here) and which local states to (re)publish (hub older or missing —
-    /// e.g. edits made while the hub was unreachable).
+    /// here) and which local states to (re)publish.
+    ///
+    /// A state is sent again only if the hub lacks it (or holds an older
+    /// one) **and** this device is responsible for it:
+    ///
+    /// - it was made here (`origin` is this device), or
+    /// - the file on disk no longer matches what we recorded (a local edit
+    ///   the watcher missed; [`Self::republish`] turns it into a new event
+    ///   from this device).
+    ///
+    /// Another device's state (its edits, its deletes, its conflict copies)
+    /// is never relayed: that device republishes it itself on its own
+    /// catch-up. A tombstone the hub never had is not sent either (nothing
+    /// to delete there). A hub entry newer than ours (e.g. a tombstone) is
+    /// fetched and applied, never overwritten.
     pub fn plan_catchup(&self, hub: &[Stamp]) -> (Vec<String>, Vec<String>) {
         let hub_map: BTreeMap<&str, &Stamp> = hub.iter().map(|s| (s.path.as_str(), s)).collect();
         let mut fetch = Vec::new();
@@ -487,21 +500,61 @@ impl AgentCore {
             if !is_synced_path(p) {
                 continue;
             }
-            match hub_map.get(p.as_str()) {
-                None => republish.push(p.clone()),
-                Some(h) if e.stamp.beats(h) => republish.push(p.clone()),
-                _ => {}
+            let hub_has = hub_map.get(p.as_str());
+            let hub_older = match hub_has {
+                None => true,
+                Some(h) => e.stamp.beats(h),
+            };
+            if !hub_older {
+                continue;
             }
+            if self.changed_on_disk(p) {
+                republish.push(p.clone());
+                continue;
+            }
+            if e.stamp.origin != self.device {
+                tracing::debug!(
+                    "catch-up: not relaying {p} v{} from {} (that device republishes its own states)",
+                    e.stamp.version,
+                    e.stamp.origin
+                );
+                continue;
+            }
+            if e.stamp.deleted && hub_has.is_none() {
+                continue;
+            }
+            republish.push(p.clone());
         }
         (fetch, republish)
+    }
+
+    /// Does the disk differ from the state recorded for `rel` (cheap stat
+    /// check; [`Self::republish`] confirms with the hash)?
+    fn changed_on_disk(&self, rel: &str) -> bool {
+        let Some(e) = self.state.entries.get(rel) else {
+            return false;
+        };
+        match (self.fs.stat(rel), e.stamp.deleted) {
+            (None, true) => false,
+            (Some(_), true) | (None, false) => true,
+            (Some((m, sz)), false) => match (e.mtime_ms, e.size) {
+                (Some(rm), Some(rs)) => (rm, rs) != (m, sz),
+                // No recorded stat: compare the hash.
+                _ => !matches!(
+                    self.fs.read(rel),
+                    Ok(Disk::Present { ref sha256, .. }) if *sha256 == e.stamp.sha256
+                ),
+            },
+        }
     }
 
     /// Rebuild the event for our recorded state of `rel` (so the hub can
     /// store it). If the disk no longer matches, treat it as a local change.
     ///
-    /// The resent event keeps the original writer (who made this state) and
-    /// carries cause `catchup-republish`, so the hub log shows that an old
-    /// state came back from this device.
+    /// The resent event keeps the original writer (who made this state;
+    /// `<device>/catchup` when an older build recorded none) and carries
+    /// cause `catchup-republish`. Another device's unchanged state is never
+    /// resent (returns `None`).
     pub fn republish(&mut self, rel: &str) -> io::Result<Option<NoteEvent>> {
         if !is_synced_path(rel) {
             return Ok(None);
@@ -510,10 +563,17 @@ impl AgentCore {
             return Ok(None);
         };
         if st.writer.is_none() {
-            st.writer = Some(format!("{}/{}", self.device, "unknown"));
+            // Made by an older build that did not record writers.
+            st.writer = Some(format!("{}/catchup", self.device));
         }
         st.cause = Some(cause::CATCHUP_REPUBLISH.to_string());
+        let foreign = st.origin != self.device;
         match (self.fs.read(rel)?, st.deleted) {
+            // Unchanged here and made elsewhere: not ours to resend.
+            (Disk::Absent, true) if foreign => Ok(None),
+            (Disk::Present { ref sha256, .. }, false) if foreign && *sha256 == st.sha256 => {
+                Ok(None)
+            }
             (Disk::Absent, true) => Ok(Some(NoteEvent {
                 format: crate::event::FORMAT_VERSION,
                 stamp: st,
@@ -588,17 +648,21 @@ pub struct Link {
 }
 
 impl Link {
-    fn source(&self) -> ZenohSource {
-        ZenohSource {
-            session: self.session.clone(),
-            timeout: self.transfer.chunk_timeout,
-        }
+    /// Chunk source for a file published by `origin`: hub, then `origin`.
+    fn source(&self, origin: &str) -> ZenohSource {
+        ZenohSource::for_agent(self.session.clone(), &self.transfer, origin)
     }
 
     /// Fetch and verify the bytes of blob reference `ev`; returns the full
     /// event.
     pub async fn fetch_blob(&self, ev: &NoteEvent) -> Result<NoteEvent, net::BoxError> {
-        fetch_blob_with(&self.source(), &self.partial_dir, &self.transfer, ev).await
+        fetch_blob_with(
+            &self.source(&ev.stamp.origin),
+            &self.partial_dir,
+            &self.transfer,
+            ev,
+        )
+        .await
     }
 }
 
@@ -794,7 +858,17 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
         transfer: opts.transfer.clone(),
         partial_dir: opts.state_dir.join("partial"),
     };
-    let blob_q = session.declare_queryable(blob::BLOB_WILDCARD).await?;
+    // Our outgoing cache answers chunk queries on its own task, so a long
+    // catch-up or fetch in the loop below never stalls a puller.
+    let blob_server = {
+        let cache = link.cache.clone();
+        blob::serve(
+            &session,
+            blob::Role::Agent(opts.device.clone()),
+            move |sha, i, cs| cache.chunk(sha, i, cs),
+        )
+        .await?
+    };
     // Finished blob fetches: (path+sha, full event if fetched).
     let (fetched_tx, mut fetched_rx) = mpsc::unbounded_channel::<(String, Option<NoteEvent>)>();
     let mut fetching: HashSet<String> = HashSet::new();
@@ -859,7 +933,7 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                                 short(&ev.stamp.sha256), ev.stamp.path, ev.stamp.version,
                                 ev.stamp.origin, b.size, b.chunks
                             );
-                            let (src, dir, t, tx) = (link.source(), link.partial_dir.clone(), link.transfer.clone(), fetched_tx.clone());
+                            let (src, dir, t, tx) = (link.source(&ev.stamp.origin), link.partial_dir.clone(), link.transfer.clone(), fetched_tx.clone());
                             tokio::spawn(async move {
                                 let r = match fetch_blob_with(&src, &dir, &t, &ev).await {
                                     Ok(full) => Some(full),
@@ -898,17 +972,6 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                         Err(e) => tracing::error!("apply {} failed: {e}", ev.stamp.path),
                     }
                     core.save_if_dirty()?;
-                }
-            }
-            q = blob_q.recv_async() => {
-                let Ok(query) = q else { break };
-                let cache = link.cache.clone();
-                if let Some((sha, i)) = blob::answer(&query, |sha, i, cs| cache.chunk(sha, i, cs)).await {
-                    if i == 0 {
-                        tracing::info!("serving blob {} (chunk 0) from the outgoing cache", short(&sha));
-                    } else {
-                        tracing::debug!("served blob {} chunk {i}", short(&sha));
-                    }
                 }
             }
             Some(p) = rx.recv() => {
@@ -980,7 +1043,7 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
     }
     core.save_if_dirty()?;
     drop(watcher);
-    drop(blob_q);
+    drop(blob_server);
     drop(link);
     session.close().await?;
     Ok(())
@@ -1101,6 +1164,115 @@ mod tests {
         // Hub already has our state: nothing to do.
         let (f, r) = c.plan_catchup(std::slice::from_ref(&mine.stamp));
         assert!(f.is_empty() && r.is_empty());
+    }
+
+    /// TowerX case: states this device only received (another device's
+    /// edit, delete or conflict copy) are not relayed when the hub lacks
+    /// them; a local edit of such a file is published as our own.
+    #[test]
+    fn catchup_never_relays_other_devices_states() {
+        let a = tempfile::tempdir().unwrap();
+        let mut c = core(a.path(), "towerx");
+        // Received from s24: endpoints v3 (the hub only has v2), a conflict
+        // copy the hub never stored, and box's delete of a test note.
+        let ep2 = NoteEvent::put("app/endpoints.json", b"v2".to_vec(), "s24", 2, None, 10);
+        let ep3 = NoteEvent::put(
+            "app/endpoints.json",
+            b"v3".to_vec(),
+            "s24",
+            3,
+            Some(ep2.stamp.sha256.clone()),
+            20,
+        );
+        let copy = NoteEvent::put(
+            "Daily/p (conflict nitro5 2026-11-18).jpg",
+            b"jpg".to_vec(),
+            "s24",
+            1,
+            None,
+            30,
+        );
+        let t1 = NoteEvent::put("Notes/zz test.md", b"t".to_vec(), "box", 2, None, 40);
+        let t3 = NoteEvent::delete(
+            "Notes/zz test.md",
+            "box",
+            3,
+            Some(t1.stamp.sha256.clone()),
+            50,
+        );
+        for ev in [&ep3, &copy, &t1, &t3] {
+            c.on_incoming(ev).unwrap();
+        }
+        assert!(c
+            .fs
+            .stat("Daily/p (conflict nitro5 2026-11-18).jpg")
+            .is_some());
+        let hub = vec![ep2.stamp.clone()];
+        let (fetch, republish) = c.plan_catchup(&hub);
+        assert!(fetch.is_empty());
+        assert!(republish.is_empty(), "relayed {republish:?}");
+        assert_eq!(c.republish("app/endpoints.json").unwrap(), None);
+        assert_eq!(c.republish("Notes/zz test.md").unwrap(), None);
+        // Edited here since: that is ours to publish, as a new version.
+        std::thread::sleep(Duration::from_millis(5));
+        c.fs.write_atomic("app/endpoints.json", b"towerx edit")
+            .unwrap();
+        let (_, republish) = c.plan_catchup(&hub);
+        assert_eq!(republish, vec!["app/endpoints.json".to_string()]);
+        let ev = c.republish("app/endpoints.json").unwrap().unwrap();
+        assert_eq!((ev.stamp.origin.as_str(), ev.stamp.version), ("towerx", 4));
+        assert_eq!(ev.stamp.writer.as_deref(), Some("towerx/external"));
+        assert_eq!(ev.stamp.cause.as_deref(), Some(cause::EXTERNAL_EDIT));
+    }
+
+    /// A tombstone on the hub newer than what we last saw is applied (the
+    /// file goes), never answered with our older live state.
+    #[test]
+    fn catchup_applies_newer_hub_tombstone() {
+        let a = tempfile::tempdir().unwrap();
+        let mut c = core(a.path(), "towerx");
+        c.fs.write_atomic("Daily/x (conflict nitro5 2026-11-18).jpg", b"jpg")
+            .unwrap();
+        let mine = c
+            .on_local("Daily/x (conflict nitro5 2026-11-18).jpg")
+            .unwrap()
+            .unwrap();
+        let gone = NoteEvent::delete(
+            &mine.stamp.path,
+            "box",
+            mine.stamp.version + 1,
+            Some(mine.stamp.sha256.clone()),
+            mine.stamp.ts_ms + 1,
+        );
+        let (fetch, republish) = c.plan_catchup(std::slice::from_ref(&gone.stamp));
+        assert_eq!(fetch, vec![mine.stamp.path.clone()]);
+        assert!(republish.is_empty());
+        let r = c.on_incoming(&gone).unwrap();
+        assert!(r.changed && r.publish.is_empty());
+        assert!(c.fs.stat(&mine.stamp.path).is_none(), "delete applied");
+        let (f, r) = c.plan_catchup(std::slice::from_ref(&gone.stamp));
+        assert!(f.is_empty() && r.is_empty());
+    }
+
+    /// Our own states still go out; one made by an older build without a
+    /// writer is labelled `<device>/catchup`. Our own tombstone for a path
+    /// the hub never had is not sent.
+    #[test]
+    fn catchup_republishes_own_states_with_a_writer_label() {
+        let a = tempfile::tempdir().unwrap();
+        let mut c = core(a.path(), "towerx");
+        c.fs.write_atomic("Notes/a.md", b"a").unwrap();
+        c.on_local("Notes/a.md").unwrap().unwrap();
+        c.state.entries.get_mut("Notes/a.md").unwrap().stamp.writer = None;
+        c.fs.write_atomic("Notes/gone.md", b"g").unwrap();
+        c.on_local("Notes/gone.md").unwrap().unwrap();
+        c.fs.remove("Notes/gone.md").unwrap();
+        assert!(c.on_local("Notes/gone.md").unwrap().unwrap().stamp.deleted);
+        let (_, republish) = c.plan_catchup(&[]);
+        assert_eq!(republish, vec!["Notes/a.md".to_string()]);
+        let ev = c.republish("Notes/a.md").unwrap().unwrap();
+        assert_eq!(ev.stamp.writer.as_deref(), Some("towerx/catchup"));
+        assert_eq!(ev.stamp.cause.as_deref(), Some(cause::CATCHUP_REPUBLISH));
     }
 
     #[test]

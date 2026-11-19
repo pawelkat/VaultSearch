@@ -70,16 +70,30 @@ droppable network message`). Files above `--inline-max`
    file's `sha256`) and `blob: {size, chunk_size, chunks}`, no `content`.
    It is a few hundred bytes.
 2. The bytes are pulled with Zenoh queries on
-   `vault/blob/<sha256>/<index>?cs=<chunk_size>` (`--chunk-size` /
-   `VAULT_EVENTS_CHUNK_SIZE`, default 256 KiB). Queries ask for
-   `Priority::DataLow` and `CongestionControl::Drop`, and replies inherit
-   both, so bulk bytes never block note events; a dropped reply is a
-   missing chunk that is asked for again.
+   `vault/blob/<sha256>/<index>?cs=<chunk_size>;src=<who>` (`--chunk-size` /
+   `VAULT_EVENTS_CHUNK_SIZE`, default 256 KiB), four chunks in flight
+   (`VAULT_EVENTS_IN_FLIGHT`). Queries ask for `Priority::DataLow` and
+   `CongestionControl::Block`, and replies inherit both: note events still go
+   first, and a 256 KiB reply crossing a slow router (note4c) waits for room
+   instead of being dropped fragment by fragment. The transfer is pull-driven,
+   so at most four chunks per transfer are queued.
 
 Who serves chunks: the hub, from `<data-dir>/blobs/<sha256>` (required), and
 the sending agent, from an in-memory cache of what it published in the last
-30 minutes (max 256 MiB). Receivers ask the best-matching queryable first,
-then all of them.
+30 minutes (max 256 MiB). Each query names one server with `src`:
+
+| Asker | Order |
+|---|---|
+| agent (live event or catch-up) | `src=hub`, then `src=<origin device>`, then `src=any` |
+| hub pulling a new file | `src=<origin device>`, then `src=any` |
+
+The hub answers `hub`/`any`, an agent answers its own device name/`any`, and
+everyone answers a query without `src` (receivers before this change). The
+receiver keeps the first server that answered for the rest of the file, takes
+the first reply, and does not wait for the query's final message. So each
+chunk crosses the network once. Both the hub and agents answer chunk queries
+on their own task, so a long catch-up or fetch never delays a puller.
+`vault-events blob get|serve|ping` time a transfer without touching a vault.
 
 Hub ingest is pull-based: the hub gets the reference, pulls the chunks from
 the sender's queryable, checks the SHA-256, and only then stores the entry
@@ -203,14 +217,21 @@ vault-events agent --vault ~/Obsidian/Vault --device box \
 
 Start-up: open a Zenoh client session (retries every 10 s while the hub is
 unreachable), subscribe, start the `notify` watcher, **catch up** (fetch the
-hub index; fetch and apply every note the hub has newer; republish every local
-state the hub lacks or has older), then **scan** the vault and publish local
-changes made while the agent was down. Then:
+hub index; fetch and apply every note the hub has newer, tombstones included;
+republish the states the hub lacks or has older **that this device made**, or
+files changed on disk since they were recorded), then **scan** the vault and
+publish local changes made while the agent was down. Then:
 
 - watcher events are debounced (`--debounce-ms`, 750) and published;
 - incoming samples are applied with the rules above;
 - catch-up repeats every `--catchup-secs` (300) and whenever the router link
   comes back; a full rescan runs every `--rescan-secs` (600).
+
+Catch-up never relays another device's state (its edits, deletes or conflict
+copies), even when the hub lacks it: the device that made it republishes it
+on its own catch-up. A tombstone the hub never had is not sent. A
+republished state keeps its writer label; one recorded by an older build
+without a writer is sent as `<device>/catchup`.
 
 Echo suppression: after writing a file the agent records the incoming stamp
 together with that file's SHA-256, so its own write seen by the watcher hashes

@@ -125,7 +125,15 @@ pub async fn run(
         .declare_queryable(key::HISTORY_WILDCARD)
         .complete(true)
         .await?;
-    let blob_q = session.declare_queryable(blob::BLOB_WILDCARD).await?;
+    // Chunk queries are answered on their own task (never behind the store
+    // lock or a slow note query) and only when asked as `src=hub`/`any`.
+    let _blob_server = {
+        let blobs = store.lock().await.blobs().clone();
+        blob::serve(&session, blob::Role::Hub, move |sha, i, cs| {
+            blobs.read_chunk(sha, i, cs).ok().flatten()
+        })
+        .await?
+    };
     let partial_dir = opts.data_dir.join("partial");
     // Finished pulls: (sha256, the reference to store if the pull worked).
     let (pulled_tx, mut pulled_rx) = mpsc::unbounded_channel::<(String, Option<NoteEvent>)>();
@@ -172,7 +180,7 @@ pub async fn run(
                                 short(&sha), ev.stamp.path, ev.stamp.version, ev.stamp.origin,
                                 info.size, info.chunks, info.chunk_size
                             );
-                            let src = ZenohSource { session: session.clone(), timeout: opts.transfer.chunk_timeout };
+                            let src = ZenohSource::for_hub(session.clone(), &opts.transfer, &ev.stamp.origin);
                             let (tx, dir, topts) = (pulled_tx.clone(), partial_dir.clone(), opts.transfer.clone());
                             tokio::spawn(async move {
                                 let res = blob::fetch(&src, &dir, &sha, &info, &topts).await;
@@ -251,19 +259,6 @@ pub async fn run(
                         && backup_due.is_none()
                     {
                         backup_due = Some(Instant::now() + opts.backup_interval);
-                    }
-                }
-            }
-            q = blob_q.recv_async() => {
-                let Ok(query) = q else { break };
-                let blobs = store.lock().await.blobs().clone();
-                if let Some((sha, i)) = blob::answer(&query, |sha, i, cs| {
-                    blobs.read_chunk(sha, i, cs).ok().flatten()
-                }).await {
-                    if i == 0 {
-                        tracing::info!("serving blob {} (chunk 0)", short(&sha));
-                    } else {
-                        tracing::debug!("served blob {} chunk {i}", short(&sha));
                     }
                 }
             }

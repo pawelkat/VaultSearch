@@ -10,10 +10,20 @@
 //!   files it just published, so the hub (and early receivers) can pull
 //!   the bytes before the hub has them.
 //!
-//! Requests ask for low priority and `CongestionControl::Drop`; replies
-//! inherit both from the query, so a 7 MB photo never sits in a session's
-//! non-droppable queue in front of note events. A dropped reply is just a
-//! missing chunk: the receiver asks again for the chunks it lacks.
+//! Each query names who should answer with a `src` parameter
+//! (`?cs=<chunk_size>;src=<who>`): `hub`, the sending device, or `any`.
+//! Receivers ask the hub first, then the device that published the file,
+//! then anyone, and keep using whichever answered. So one holder sends each
+//! chunk and a slow router hop (note4c) never carries the same 256 KiB twice.
+//! Queries without `src` (older receivers) are answered by everyone.
+//!
+//! Chunk queries use priority `DataLow` and `CongestionControl::Block`
+//! (replies inherit both): a reply crossing a slow router waits for room
+//! instead of being dropped fragment by fragment, which used to cost a 15 s
+//! timeout per lost chunk. Transfers are pull-driven with a few chunks in
+//! flight, so blocking never queues more than that. Note events keep
+//! their normal priority and go ahead of chunk replies. A receiver takes
+//! the first reply and does not wait for the query's final message.
 //!
 //! Receivers assemble into `<partial-dir>/<sha256>.part` (outside the vault,
 //! so neither the watcher, Obsidian nor rclone bisync ever see a partial
@@ -29,6 +39,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use zenoh::qos::{CongestionControl, Priority};
 use zenoh::query::{ConsolidationMode, QueryTarget};
 use zenoh::sample::Locality;
@@ -45,6 +58,8 @@ pub const DEFAULT_INLINE_MAX: u64 = 1 << 20;
 /// Default chunk size (256 KiB).
 pub const DEFAULT_CHUNK_SIZE: u64 = 256 << 10;
 pub const MIN_CHUNK_SIZE: u64 = 4 << 10;
+/// Chunk queries in flight per transfer (1 MiB at the default chunk size).
+pub const DEFAULT_IN_FLIGHT: usize = 4;
 pub const MAX_CHUNK_SIZE: u64 = 4 << 20;
 
 /// `ceil(size / chunk_size)`; 0 for an empty file.
@@ -72,6 +87,35 @@ pub fn blob_key(sha: &str, i: u64) -> String {
 /// `vault/blob/<sha256>/<i>?cs=<chunk_size>`
 pub fn blob_selector(sha: &str, i: u64, chunk_size: u64) -> String {
     format!("{}?cs={chunk_size}", blob_key(sha, i))
+}
+
+/// `src` value asking only the hub.
+pub const SRC_HUB: &str = "hub";
+/// `src` value asking every holder.
+pub const SRC_ANY: &str = "any";
+
+/// `vault/blob/<sha256>/<i>?cs=<chunk_size>;src=<who>`
+pub fn blob_selector_src(sha: &str, i: u64, chunk_size: u64, src: &str) -> String {
+    format!("{};src={src}", blob_selector(sha, i, chunk_size))
+}
+
+/// Who serves chunks: the hub (blob store) or an agent (its outgoing cache).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Role {
+    Hub,
+    Agent(String),
+}
+
+impl Role {
+    /// Answer a query carrying `src`? No `src` (older receivers) and `any`
+    /// mean everyone; otherwise only the named server.
+    pub fn answers(&self, src: Option<&str>) -> bool {
+        match (self, src) {
+            (_, None) | (_, Some(SRC_ANY)) => true,
+            (Role::Hub, Some(s)) => s == SRC_HUB,
+            (Role::Agent(d), Some(s)) => s == d,
+        }
+    }
 }
 
 /// Inverse of [`blob_key`]: `(sha256, index)`.
@@ -104,6 +148,8 @@ pub struct TransferOpts {
     pub rounds: u32,
     /// Pause between passes (doubles each time, max 8x).
     pub backoff: Duration,
+    /// Chunk queries in flight per transfer.
+    pub in_flight: usize,
 }
 
 impl Default for TransferOpts {
@@ -114,13 +160,14 @@ impl Default for TransferOpts {
             chunk_timeout: Duration::from_secs(15),
             rounds: 8,
             backoff: Duration::from_millis(500),
+            in_flight: DEFAULT_IN_FLIGHT,
         }
     }
 }
 
 impl TransferOpts {
     /// Defaults, overridden by `VAULT_EVENTS_INLINE_MAX` /
-    /// `VAULT_EVENTS_CHUNK_SIZE` (bytes) when set.
+    /// `VAULT_EVENTS_CHUNK_SIZE` (bytes) and `VAULT_EVENTS_IN_FLIGHT` when set.
     pub fn from_env() -> Self {
         let mut o = TransferOpts::default();
         if let Some(v) = env_u64("VAULT_EVENTS_INLINE_MAX") {
@@ -129,11 +176,15 @@ impl TransferOpts {
         if let Some(v) = env_u64("VAULT_EVENTS_CHUNK_SIZE") {
             o.chunk_size = v;
         }
+        if let Some(v) = env_u64("VAULT_EVENTS_IN_FLIGHT") {
+            o.in_flight = v as usize;
+        }
         o.normalized()
     }
 
     pub fn normalized(mut self) -> Self {
         self.chunk_size = self.chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+        self.in_flight = self.in_flight.clamp(1, 16);
         self
     }
 }
@@ -479,15 +530,27 @@ pub async fn fetch<S: ChunkSource>(
     let mut retries = 0u64;
     let mut last_mismatch: Option<String> = None;
     let mut wait = opts.backoff;
+    let width = opts.in_flight.max(1);
     for round in 0..opts.rounds.max(1) {
-        for i in asm.missing() {
-            match src.chunk(sha, i, cs).await {
-                Some(b) if asm.put(i, &b)? => {}
+        // Up to `width` chunk queries in flight. After `width` failures in
+        // a row the source is gone for now: stop asking, back off, retry.
+        let mut todo = asm.missing().into_iter();
+        let mut running = FuturesUnordered::new();
+        let mut failed_in_a_row = 0usize;
+        loop {
+            while running.len() < width && failed_in_a_row < width {
+                let Some(i) = todo.next() else { break };
+                running.push(async move { (i, src.chunk(sha, i, cs).await) });
+            }
+            let Some((i, got)) = running.next().await else {
+                break;
+            };
+            match got {
+                Some(b) if asm.put(i, &b)? => failed_in_a_row = 0,
                 _ => {
-                    // Nobody answered (or a wrong length): back off and
-                    // retry this and the remaining chunks next pass.
+                    // Nobody answered (or a wrong length): retried next pass.
                     retries += 1;
-                    break;
+                    failed_in_a_row += 1;
                 }
             }
         }
@@ -527,45 +590,94 @@ pub async fn fetch<S: ChunkSource>(
     }
 }
 
-/// [`ChunkSource`] over a Zenoh session: first the best-matching
-/// queryable, then every queryable (the hub may not have pulled the blob
-/// yet while the sender still has it). Low priority, droppable.
+/// [`ChunkSource`] over a Zenoh session. Tries the `src` values in order
+/// (e.g. `hub`, the sending device, `any`) and sticks to the first that
+/// answers. Takes the first non-empty reply without waiting for the final.
 pub struct ZenohSource {
-    pub session: Session,
-    pub timeout: Duration,
+    session: Session,
+    timeout: Duration,
+    sources: Vec<String>,
+    pref: AtomicUsize,
 }
 
 impl ZenohSource {
-    async fn ask(&self, sel: &str, target: QueryTarget) -> Option<Vec<u8>> {
-        let replies = self
-            .session
+    /// Ask everyone (diagnostics).
+    pub fn new(session: Session, opts: &TransferOpts) -> Self {
+        Self::with_sources(session, opts, &[SRC_ANY])
+    }
+
+    /// An agent fetching a file published by `origin`: hub, then `origin`,
+    /// then anyone.
+    pub fn for_agent(session: Session, opts: &TransferOpts, origin: &str) -> Self {
+        Self::with_sources(session, opts, &[SRC_HUB, origin, SRC_ANY])
+    }
+
+    /// The hub pulling a file published by `origin`: `origin`, then anyone.
+    pub fn for_hub(session: Session, opts: &TransferOpts, origin: &str) -> Self {
+        Self::with_sources(session, opts, &[origin, SRC_ANY])
+    }
+
+    fn with_sources(session: Session, opts: &TransferOpts, srcs: &[&str]) -> Self {
+        let mut sources: Vec<String> = Vec::new();
+        for s in srcs {
+            if !s.is_empty() && !sources.iter().any(|x| x == s) {
+                sources.push(s.to_string());
+            }
+        }
+        ZenohSource {
+            session,
+            timeout: opts.chunk_timeout,
+            sources,
+            pref: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn sources(&self) -> &[String] {
+        &self.sources
+    }
+
+    async fn ask(&self, sel: &str) -> Option<Vec<u8>> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let tx = Mutex::new(Some(tx));
+        self.session
             .get(sel)
-            .target(target)
+            .callback(move |reply| {
+                if let Ok(sample) = reply.result() {
+                    let b = sample.payload().to_bytes();
+                    if !b.is_empty() {
+                        if let Some(tx) = tx.lock().ok().and_then(|mut t| t.take()) {
+                            let _ = tx.send(b.to_vec());
+                        }
+                    }
+                }
+            })
+            .target(QueryTarget::All)
             .consolidation(ConsolidationMode::None)
             .allowed_destination(Locality::Remote)
-            .congestion_control(CongestionControl::Drop)
+            .congestion_control(CongestionControl::Block)
             .priority(Priority::DataLow)
             .timeout(self.timeout)
             .await
             .ok()?;
-        while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                let b = sample.payload().to_bytes().to_vec();
-                if !b.is_empty() {
-                    return Some(b);
-                }
-            }
-        }
-        None
+        // The sender is dropped when the query ends (final reply or
+        // timeout) without data; that wakes us at once.
+        tokio::time::timeout(self.timeout + Duration::from_secs(1), rx)
+            .await
+            .ok()?
+            .ok()
     }
 }
 
 impl ChunkSource for ZenohSource {
     async fn chunk(&self, sha: &str, i: u64, chunk_size: u64) -> Option<Vec<u8>> {
         // The assembler checks the length of what comes back.
-        let sel = blob_selector(sha, i, chunk_size);
-        for target in [QueryTarget::BestMatching, QueryTarget::All] {
-            if let Some(b) = self.ask(&sel, target).await {
+        let n = self.sources.len();
+        let start = self.pref.load(AtomicOrdering::Relaxed) % n.max(1);
+        for k in 0..n {
+            let idx = (start + k) % n;
+            let sel = blob_selector_src(sha, i, chunk_size, &self.sources[idx]);
+            if let Some(b) = self.ask(&sel).await {
+                self.pref.store(idx, AtomicOrdering::Relaxed);
                 return Some(b);
             }
         }
@@ -573,12 +685,16 @@ impl ChunkSource for ZenohSource {
     }
 }
 
-/// Answer one chunk query with `lookup(sha, index, chunk_size)`. Returns
-/// `(sha, index)` when a chunk was sent.
+/// Answer one chunk query with `lookup(sha, index, chunk_size)` if `role`
+/// is asked (`src`). Returns `(sha, index)` when a chunk was sent.
 pub async fn answer(
     query: &zenoh::query::Query,
+    role: &Role,
     lookup: impl FnOnce(&str, u64, u64) -> Option<Vec<u8>>,
 ) -> Option<(String, u64)> {
+    if !role.answers(query.parameters().get("src")) {
+        return None;
+    }
     let k = query.key_expr().as_str().to_string();
     let (sha, i) = parse_blob_key(&k)?;
     let cs = chunk_size_param(query.parameters().get("cs"));
@@ -588,6 +704,49 @@ pub async fn answer(
         return None;
     }
     Some((sha, i))
+}
+
+/// The running `vault/blob/**` queryable; dropping it stops serving.
+pub struct BlobServer {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BlobServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Declare the `vault/blob/**` queryable and answer it on its own task,
+/// one reply task per query. A busy agent loop (catch-up, a fetch, a
+/// rescan) never delays a chunk, and pipelined requests are answered side
+/// by side.
+pub async fn serve<F>(session: &Session, role: Role, lookup: F) -> Result<BlobServer, zenoh::Error>
+where
+    F: Fn(&str, u64, u64) -> Option<Vec<u8>> + Send + Sync + 'static,
+{
+    let q = session.declare_queryable(BLOB_WILDCARD).await?;
+    let lookup = Arc::new(lookup);
+    let role = Arc::new(role);
+    let task = tokio::spawn(async move {
+        while let Ok(query) = q.recv_async().await {
+            let (lookup, role) = (lookup.clone(), role.clone());
+            tokio::spawn(async move {
+                if let Some((sha, i)) = answer(&query, &role, |s, i, cs| lookup(s, i, cs)).await {
+                    if i == 0 {
+                        let from = match role.as_ref() {
+                            Role::Hub => "",
+                            Role::Agent(_) => " from the outgoing cache",
+                        };
+                        tracing::info!("serving blob {} (chunk 0){from}", short(&sha));
+                    } else {
+                        tracing::debug!("served blob {} chunk {i}", short(&sha));
+                    }
+                }
+            });
+        }
+    });
+    Ok(BlobServer { task })
 }
 
 fn short(sha: &str) -> &str {
@@ -751,9 +910,9 @@ mod tests {
         assert_eq!(f.bytes, b);
         assert_eq!(f.chunks, 5);
         assert_eq!(f.retries, 2);
-        // 0,1,2 once; 3 three times; 4 once.
+        // 0,1,2,4 once; 3 three times (the other chunks do not wait for it).
         let asked = src.asked.lock().unwrap().clone();
-        assert_eq!(asked, vec![0, 1, 2, 3, 3, 3, 4]);
+        assert_eq!(asked, vec![0, 1, 2, 3, 4, 3, 3]);
     }
 
     #[tokio::test]
@@ -762,7 +921,7 @@ mod tests {
         let b = data(20_000);
         let sha = sha256_hex(&b);
         let info = BlobInfo::new(b.len() as u64, 4096);
-        // First attempt gives up after chunk 2 never answers.
+        // First attempt gets everything but chunk 2, which never answers.
         let src = Fake::new(b.clone());
         src.fail.lock().unwrap().insert(2, 1000);
         let opts = TransferOpts {
@@ -770,15 +929,15 @@ mod tests {
             ..quick()
         };
         match fetch(&src, t.path(), &sha, &info, &opts).await {
-            Err(FetchError::Incomplete { have: 2, chunks: 5 }) => {}
+            Err(FetchError::Incomplete { have: 4, chunks: 5 }) => {}
             other => panic!("{other:?}"),
         }
-        // Second attempt asks only for 2, 3, 4.
+        // Second attempt asks only for 2.
         let src2 = Fake::new(b.clone());
         let f = fetch(&src2, t.path(), &sha, &info, &quick()).await.unwrap();
         assert_eq!(f.bytes, b);
-        assert_eq!(f.resumed, 2);
-        assert_eq!(src2.asked.lock().unwrap().clone(), vec![2, 3, 4]);
+        assert_eq!(f.resumed, 4);
+        assert_eq!(src2.asked.lock().unwrap().clone(), vec![2]);
     }
 
     #[tokio::test]
@@ -808,6 +967,95 @@ mod tests {
             fetch(&liar, t2.path(), &sha, &info, &opts).await,
             Err(FetchError::Mismatch { .. })
         ));
+    }
+
+    #[test]
+    fn src_parameter_picks_one_server() {
+        assert_eq!(
+            blob_selector_src(&"a".repeat(64), 3, 4096, SRC_HUB),
+            format!("vault/blob/{}/3?cs=4096;src=hub", "a".repeat(64))
+        );
+        let hub = Role::Hub;
+        let towerx = Role::Agent("towerx".into());
+        // Older receivers send no src: everyone answers, as before.
+        assert!(hub.answers(None) && towerx.answers(None));
+        assert!(hub.answers(Some("any")) && towerx.answers(Some("any")));
+        assert!(hub.answers(Some("hub")) && !towerx.answers(Some("hub")));
+        assert!(!hub.answers(Some("towerx")) && towerx.answers(Some("towerx")));
+        assert!(!towerx.answers(Some("s24")));
+    }
+
+    /// Slow source: each answer takes a while; counts how many run at once.
+    struct Slow {
+        bytes: Vec<u8>,
+        now: AtomicU64,
+        peak: AtomicU64,
+        gone: bool,
+        calls: AtomicU64,
+    }
+
+    impl ChunkSource for Slow {
+        async fn chunk(&self, _sha: &str, i: u64, cs: u64) -> Option<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(n, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            if self.gone {
+                return None;
+            }
+            let (o, l) = chunk_range(self.bytes.len() as u64, cs, i)?;
+            Some(self.bytes[o as usize..(o + l) as usize].to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_keeps_chunks_in_flight_and_stops_on_a_dead_source() {
+        let b = data(40_000);
+        let sha = sha256_hex(&b);
+        let info = BlobInfo::new(b.len() as u64, 4096); // 10 chunks
+        let t = tempfile::tempdir().unwrap();
+        let src = Slow {
+            bytes: b.clone(),
+            now: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            gone: false,
+            calls: AtomicU64::new(0),
+        };
+        let t0 = Instant::now();
+        let f = fetch(&src, t.path(), &sha, &info, &quick()).await.unwrap();
+        assert_eq!(f.bytes, b);
+        assert_eq!(src.peak.load(Ordering::SeqCst), DEFAULT_IN_FLIGHT as u64);
+        assert!(
+            t0.elapsed() < Duration::from_millis(150),
+            "pipelined: {:?}",
+            t0.elapsed()
+        );
+        // Nobody answers: each pass stops issuing after `in_flight` failures
+        // in a row (the 4 in flight plus 3 refills), not after all 10 chunks.
+        let t2 = tempfile::tempdir().unwrap();
+        let dead = Slow {
+            bytes: b.clone(),
+            now: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            gone: true,
+            calls: AtomicU64::new(0),
+        };
+        let opts = TransferOpts {
+            rounds: 2,
+            ..quick()
+        };
+        assert!(matches!(
+            fetch(&dead, t2.path(), &sha, &info, &opts).await,
+            Err(FetchError::Incomplete {
+                have: 0,
+                chunks: 10
+            })
+        ));
+        assert_eq!(
+            dead.calls.load(Ordering::Relaxed),
+            2 * (2 * DEFAULT_IN_FLIGHT as u64 - 1)
+        );
     }
 
     #[test]

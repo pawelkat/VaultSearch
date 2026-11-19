@@ -29,11 +29,15 @@ impl Running {
 }
 
 fn start_hub(data: &Path, port: u16) -> Running {
+    start_hub_connecting(data, port, vec![])
+}
+
+fn start_hub_connecting(data: &Path, port: u16, connect: Vec<String>) -> Running {
     let (tx, rx) = watch::channel(false);
     let opts = hub::HubOpts {
         data_dir: data.to_path_buf(),
         listen: vec![format!("tcp/127.0.0.1:{port}")],
-        connect: vec![],
+        connect,
         name: "test-hub".into(),
         backup_config: None,
         backup_interval: Duration::from_secs(60),
@@ -492,4 +496,73 @@ async fn large_file_travels_in_chunks() {
     c.stop().await;
     b.stop().await;
     hub.stop().await;
+}
+
+/// The live topology: the hub dials out into a plain Zenoh router (like
+/// note4c) and a device is connected only to that router, so every chunk
+/// crosses the extra hop. A 7 MB file goes device -> hub -> box agent and a
+/// 5 MB file goes back, each in one pass with no lost chunks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_files_cross_a_plain_router_both_ways() {
+    let root = tempfile::tempdir().unwrap();
+    let p = |n: &str| root.path().join(n);
+    let (hub_dir, va, vb) = (p("hub"), p("vault-box"), p("vault-towerx"));
+    for d in [&va, &vb] {
+        std::fs::create_dir_all(d.join("Daily")).unwrap();
+    }
+    let (rport, hport) = (free_port(), free_port());
+    let router = zenoh::open(net::router_config(&[format!("tcp/127.0.0.1:{rport}")], &[]).unwrap())
+        .await
+        .unwrap();
+    let hub = start_hub_connecting(&hub_dir, hport, vec![format!("tcp/127.0.0.1:{rport}")]);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let big_max = 16 << 20;
+    let a = start_agent_opts(&va, &p("state-box"), "box", hport, None, big_max);
+    let b = start_agent_opts(&vb, &p("state-towerx"), "towerx", rport, None, big_max);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let up = photo_bytes(7_000_000, 7);
+    let up_sha = event::sha256_hex(&up);
+    let t0 = Instant::now();
+    std::fs::write(vb.join("Daily/towerx.jpg"), &up).unwrap();
+    wait_for(
+        "7 MB towerx -> router -> hub -> box",
+        Duration::from_secs(30),
+        || sha_of(&va.join("Daily/towerx.jpg")).as_deref() == Some(up_sha.as_str()),
+    )
+    .await;
+    let up_t = t0.elapsed();
+
+    let down = photo_bytes(5_000_000, 8);
+    let down_sha = event::sha256_hex(&down);
+    let t1 = Instant::now();
+    std::fs::write(va.join("Daily/box.jpg"), &down).unwrap();
+    wait_for(
+        "5 MB box -> hub -> router -> towerx",
+        Duration::from_secs(30),
+        || sha_of(&vb.join("Daily/box.jpg")).as_deref() == Some(down_sha.as_str()),
+    )
+    .await;
+    let down_t = t1.elapsed();
+    eprintln!("through the router: up {up_t:?}, down {down_t:?}");
+    assert!(up_t < Duration::from_secs(15) && down_t < Duration::from_secs(15));
+    assert_eq!(
+        sha_of(&hub_dir.join("blobs").join(&up_sha)).as_deref(),
+        Some(up_sha.as_str())
+    );
+    // Notes still flow both ways across the router afterwards.
+    std::fs::write(vb.join("Daily/after.md"), "linked\n").unwrap();
+    wait_for("note towerx -> box", T, || {
+        read(va.join("Daily/after.md")).as_deref() == Some("linked\n")
+    })
+    .await;
+    for v in [&va, &vb] {
+        assert!(conflict_copies(&v.join("Daily")).is_empty());
+    }
+    assert!(all_files(&p("state-towerx").join("partial")).is_empty());
+
+    b.stop().await;
+    a.stop().await;
+    hub.stop().await;
+    router.close().await.unwrap();
 }

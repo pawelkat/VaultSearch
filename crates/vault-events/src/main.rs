@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -154,6 +155,10 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Transfer diagnostics: pull one blob (`get`) or serve one file's
+    /// chunks (`serve`) without touching any vault. `get` prints the timing.
+    #[command(subcommand)]
+    Blob(BlobCmd),
     /// Print what the hub stores (path, version, origin) via the index query.
     Index {
         #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
@@ -161,6 +166,43 @@ enum Cmd {
         /// Only print counts.
         #[arg(long)]
         summary: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlobCmd {
+    /// Pull blob <SHA256> (SIZE bytes) chunk by chunk and verify it.
+    Get {
+        sha256: String,
+        size: u64,
+        #[arg(long, default_value_t = blob::DEFAULT_CHUNK_SIZE)]
+        chunk_size: u64,
+        #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
+        connect: Vec<String>,
+        /// Also write the verified bytes here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Ask like an agent fetching a file from this device (hub first,
+        /// then the device, then anyone). Default: ask everyone.
+        #[arg(long)]
+        origin: Option<String>,
+    },
+    /// Time one raw query (all targets): replies and when it closes.
+    Ping {
+        selector: String,
+        #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
+        connect: Vec<String>,
+    },
+    /// Serve FILE's chunks under its SHA-256 for SECS seconds.
+    Serve {
+        file: PathBuf,
+        #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
+        connect: Vec<String>,
+        #[arg(long, default_value_t = 120)]
+        secs: u64,
+        /// Answer as this device (`src=<device>` or `any`).
+        #[arg(long, default_value = "probe")]
+        device: String,
     },
 }
 
@@ -377,6 +419,89 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                     state_dir.display()
                 );
             }
+            Ok(())
+        }
+        Cmd::Blob(BlobCmd::Get {
+            sha256,
+            size,
+            chunk_size,
+            connect,
+            out,
+            origin,
+        }) => {
+            if !event::is_sha256_hex(&sha256) {
+                return Err(format!("{sha256}: not a sha256").into());
+            }
+            let s = zenoh::open(net::client_config(&connect)?).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let topts = blob::TransferOpts::from_env();
+            let src = match &origin {
+                Some(o) => blob::ZenohSource::for_agent(s.clone(), &topts, o),
+                None => blob::ZenohSource::new(s.clone(), &topts),
+            };
+            let tmp =
+                std::env::temp_dir().join(format!("vault-events-probe-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp)?;
+            let info = event::BlobInfo::new(size, chunk_size);
+            let res = blob::fetch(&src, &tmp, &sha256, &info, &topts).await;
+            let _ = std::fs::remove_dir_all(&tmp);
+            s.close().await?;
+            let f = res?;
+            println!(
+                "fetched {} B in {} chunks in {} ms ({} retried), sha256 ok",
+                f.bytes.len(),
+                f.chunks,
+                f.elapsed.as_millis(),
+                f.retries
+            );
+            if let Some(o) = out {
+                std::fs::write(o, &f.bytes)?;
+            }
+            Ok(())
+        }
+        Cmd::Blob(BlobCmd::Ping { selector, connect }) => {
+            let s = zenoh::open(net::client_config(&connect)?).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            for target in [
+                zenoh::query::QueryTarget::BestMatching,
+                zenoh::query::QueryTarget::All,
+            ] {
+                let t = std::time::Instant::now();
+                let r = s
+                    .get(selector.as_str())
+                    .target(target)
+                    .consolidation(zenoh::query::ConsolidationMode::None)
+                    .timeout(Duration::from_secs(20))
+                    .await?;
+                while let Ok(rep) = r.recv_async().await {
+                    let n = rep.result().map(|x| x.payload().len()).unwrap_or(0);
+                    println!("{target:?}: reply {n} B at {} ms", t.elapsed().as_millis());
+                }
+                println!("{target:?}: closed at {} ms", t.elapsed().as_millis());
+            }
+            s.close().await?;
+            Ok(())
+        }
+        Cmd::Blob(BlobCmd::Serve {
+            file,
+            connect,
+            secs,
+            device,
+        }) => {
+            let bytes = std::fs::read(&file)?;
+            let sha = event::sha256_hex(&bytes);
+            let size = bytes.len();
+            let s = zenoh::open(net::client_config(&connect)?).await?;
+            let cache = Arc::new(blob::OutgoingCache::default());
+            cache.insert(&sha, bytes);
+            let server = blob::serve(&s, blob::Role::Agent(device), move |sha, i, cs| {
+                cache.chunk(sha, i, cs)
+            })
+            .await?;
+            println!("serving {sha} ({size} B) for {secs} s");
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            drop(server);
+            s.close().await?;
             Ok(())
         }
         Cmd::Who {
