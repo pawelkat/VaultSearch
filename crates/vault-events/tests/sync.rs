@@ -127,7 +127,9 @@ async fn hub_version(port: u16, path: &str) -> Option<u64> {
     let s = zenoh::open(net::client_config(&[format!("tcp/127.0.0.1:{port}")]).unwrap())
         .await
         .unwrap();
-    let r = net::fetch_index(&s, Duration::from_secs(5)).await.unwrap();
+    let r = net::fetch_index(&s, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
     s.close().await.unwrap();
     r.and_then(|r| {
         r.stamps
@@ -273,7 +275,7 @@ async fn history(port: u16, path: &str) -> Vec<vault_events::history::HistoryEnt
     let s = zenoh::open(net::client_config(&[format!("tcp/127.0.0.1:{port}")]).unwrap())
         .await
         .unwrap();
-    let r = net::fetch_history(&s, path, 0, Duration::from_secs(5))
+    let r = net::fetch_history(&s, path, 0, "test", Duration::from_secs(5))
         .await
         .unwrap();
     s.close().await.unwrap();
@@ -437,13 +439,13 @@ async fn large_file_travels_in_chunks() {
     let s = zenoh::open(net::client_config(&[format!("tcp/127.0.0.1:{port}")]).unwrap())
         .await
         .unwrap();
-    let idx = net::fetch_index(&s, Duration::from_secs(5))
+    let idx = net::fetch_index(&s, "test", Duration::from_secs(5))
         .await
         .unwrap()
         .unwrap();
     let st = idx.stamps.iter().find(|s| s.path == rel).unwrap();
     assert_eq!(st.sha256, sha);
-    let stored = net::fetch_note(&s, rel, Duration::from_secs(5))
+    let stored = net::fetch_note(&s, rel, "test", Duration::from_secs(5))
         .await
         .unwrap()
         .unwrap();
@@ -565,4 +567,102 @@ async fn large_files_cross_a_plain_router_both_ways() {
     a.stop().await;
     hub.stop().await;
     router.close().await.unwrap();
+}
+
+async fn hub_peers(s: &zenoh::Session) -> Vec<vault_events::presence::Peer> {
+    vault_events::presence::fetch_hub_presence(s, "test", Duration::from_secs(3))
+        .await
+        .map(|r| r.peers)
+        .unwrap_or_default()
+}
+
+/// Agents announce `vault/presence/<device>`, the hub tracks join/leave
+/// with build info, and every agent query carries `from=<device>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn presence_and_requester_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let hub = start_hub(&tmp.path().join("hub"), port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A spy answering the index key too: records the `from` it is asked with.
+    let s = zenoh::open(net::client_config(&[format!("tcp/127.0.0.1:{port}")]).unwrap())
+        .await
+        .unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let spy = {
+        let seen = seen.clone();
+        s.declare_queryable(vault_events::key::INDEX_KEY)
+            .callback(move |q| {
+                seen.lock().unwrap().push(net::requester(&q));
+            })
+            .await
+            .unwrap()
+    };
+
+    let (va, vb) = (tmp.path().join("va"), tmp.path().join("vb"));
+    std::fs::create_dir_all(&va).unwrap();
+    std::fs::create_dir_all(&vb).unwrap();
+    let a = start_agent(&va, &tmp.path().join("sa"), "laptop", port);
+    let b = start_agent(&vb, &tmp.path().join("sb"), "phone-2", port);
+
+    let t = Instant::now();
+    let both = loop {
+        let peers = hub_peers(&s).await;
+        let ok = ["laptop", "phone-2"].iter().all(|d| {
+            peers
+                .iter()
+                .any(|p| p.device == *d && p.online && p.info.is_some())
+        });
+        if ok {
+            break peers;
+        }
+        assert!(t.elapsed() < T, "agents never showed up online: {peers:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let info = both
+        .iter()
+        .find(|p| p.device == "laptop")
+        .unwrap()
+        .info
+        .clone()
+        .unwrap();
+    assert_eq!(info.role, "agent");
+    assert_eq!(info.build, format!("vault-events {}", net::build_version()));
+    assert_eq!(
+        vault_events::presence::live_tokens(&s, Duration::from_secs(3)).await,
+        vec!["laptop".to_string(), "phone-2".to_string()]
+    );
+
+    wait_for("agents' catch-up queries carry from=", T, || {
+        let v = seen.lock().unwrap();
+        v.iter().any(|f| f == "laptop") && v.iter().any(|f| f == "phone-2")
+    })
+    .await;
+    assert!(!seen.lock().unwrap().iter().any(|f| f == "unknown"));
+
+    // phone-2 leaves: offline with a last-seen time, laptop stays.
+    b.stop().await;
+    let t = Instant::now();
+    loop {
+        let peers = hub_peers(&s).await;
+        let phone = peers.iter().find(|p| p.device == "phone-2");
+        if phone.is_some_and(|p| !p.online && p.last_seen_ms > 0)
+            && peers.iter().any(|p| p.device == "laptop" && p.online)
+        {
+            break;
+        }
+        assert!(t.elapsed() < T, "phone-2 never went offline: {peers:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        hub::online_line(&["box".into(), "s24".into()]),
+        "online: box, s24"
+    );
+    assert_eq!(hub::online_line(&[]), "online: none");
+
+    drop(spy);
+    s.close().await.unwrap();
+    a.stop().await;
+    hub.stop().await;
 }

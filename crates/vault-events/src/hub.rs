@@ -14,6 +14,7 @@ use crate::event::{now_ms, NoteEvent};
 use crate::history::{History, HistoryEntry, HistoryReply};
 use crate::key;
 use crate::net::{self, BoxError, IndexReply};
+use crate::presence;
 use crate::store::HubStore;
 use crate::vault::is_synced_path;
 
@@ -129,11 +130,43 @@ pub async fn run(
     // lock or a slow note query) and only when asked as `src=hub`/`any`.
     let _blob_server = {
         let blobs = store.lock().await.blobs().clone();
-        blob::serve(&session, blob::Role::Hub, move |sha, i, cs| {
-            blobs.read_chunk(sha, i, cs).ok().flatten()
-        })
+        let names = store.clone();
+        blob::serve(
+            &session,
+            blob::Role::Hub,
+            move |sha, i, cs| blobs.read_chunk_sized(sha, i, cs).ok().flatten(),
+            move |sha| {
+                let names = names.clone();
+                async move {
+                    let s = names.lock().await;
+                    let p = s
+                        .stamps()
+                        .find(|st| st.sha256 == sha)
+                        .map(|st| st.path.clone());
+                    p
+                }
+            },
+        )
         .await?
     };
+    // Presence: `vault/presence/<device>` liveliness tokens.
+    let presence_sub = session
+        .liveliness()
+        .declare_subscriber(presence::PRESENCE_WILDCARD)
+        .history(true)
+        .await?;
+    let presence_q = session
+        .declare_queryable(presence::HUB_PRESENCE_KEY)
+        .complete(true)
+        .await?;
+    let mut registry = presence::Registry::default();
+    let (info_tx, mut info_rx) = mpsc::unbounded_channel::<presence::PresenceInfo>();
+    let mut online_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + ONLINE_LOG_EVERY,
+        ONLINE_LOG_EVERY,
+    );
+    let hub_build = format!("vault-events {}", net::build_version());
+    tracing::info!("hub {} build {hub_build}", opts.name);
     let partial_dir = opts.data_dir.join("partial");
     // Finished pulls: (sha256, the reference to store if the pull worked).
     let (pulled_tx, mut pulled_rx) = mpsc::unbounded_channel::<(String, Option<NoteEvent>)>();
@@ -180,7 +213,7 @@ pub async fn run(
                                 short(&sha), ev.stamp.path, ev.stamp.version, ev.stamp.origin,
                                 info.size, info.chunks, info.chunk_size
                             );
-                            let src = ZenohSource::for_hub(session.clone(), &opts.transfer, &ev.stamp.origin);
+                            let src = ZenohSource::for_hub(session.clone(), &opts.transfer, &ev.stamp.origin, "hub");
                             let (tx, dir, topts) = (pulled_tx.clone(), partial_dir.clone(), opts.transfer.clone());
                             tokio::spawn(async move {
                                 let res = blob::fetch(&src, &dir, &sha, &info, &topts).await;
@@ -227,6 +260,7 @@ pub async fn run(
             q = notes_q.recv_async() => {
                 let Ok(query) = q else { break };
                 let qk = query.key_expr().clone();
+                tracing::debug!("note query {} from {}", qk.as_str(), net::requester(&query));
                 let replies: Vec<(String, Vec<u8>)> = {
                     let s = store.lock().await;
                     let mut v = Vec::new();
@@ -268,6 +302,7 @@ pub async fn run(
                     let s = store.lock().await;
                     IndexReply { format: 1, hub: opts.name.clone(), stamps: s.stamps().cloned().collect() }
                 };
+                tracing::info!("catch-up from {}: {} listed", net::requester(&query), body.stamps.len());
                 if let Err(e) = query.reply(key::INDEX_KEY, serde_json::to_vec(&body)?).await {
                     tracing::warn!("index reply failed: {e}");
                 }
@@ -275,6 +310,7 @@ pub async fn run(
             q = history_q.recv_async() => {
                 let Ok(query) = q else { break };
                 let qk = query.key_expr().as_str().to_string();
+                tracing::debug!("history query {qk} from {}", net::requester(&query));
                 let limit: usize = query
                     .parameters()
                     .get("limit")
@@ -296,6 +332,49 @@ pub async fn run(
                     }
                     Err(e) => tracing::debug!("history query on {qk} ignored: {e}"),
                 }
+            }
+            s = presence_sub.recv_async() => {
+                let Ok(sample) = s else { break };
+                let Some(dev) = presence::device_of_key(sample.key_expr().as_str()) else { continue };
+                let now = now_ms();
+                match sample.kind() {
+                    zenoh::sample::SampleKind::Put => {
+                        if registry.join(&dev, now) {
+                            tracing::info!("device online: {dev}");
+                            let (s, tx) = (session.clone(), info_tx.clone());
+                            tokio::spawn(async move {
+                                if let Some(i) = presence::fetch_info(&s, &dev, "hub", Duration::from_secs(5)).await {
+                                    let _ = tx.send(i);
+                                }
+                            });
+                        }
+                    }
+                    zenoh::sample::SampleKind::Delete => {
+                        if registry.leave(&dev, now) {
+                            tracing::info!("device offline: {dev}");
+                        }
+                    }
+                }
+            }
+            Some(info) = info_rx.recv() => {
+                tracing::info!("device {}: {} {}", info.device, info.role, info.build);
+                registry.set_info(info);
+            }
+            q = presence_q.recv_async() => {
+                let Ok(query) = q else { break };
+                tracing::debug!("presence query from {}", net::requester(&query));
+                let body = presence::PresenceReply {
+                    hub: opts.name.clone(),
+                    hub_build: hub_build.clone(),
+                    now_ms: now_ms(),
+                    peers: registry.snapshot(now_ms()),
+                };
+                if let Err(e) = query.reply(presence::HUB_PRESENCE_KEY, serde_json::to_vec(&body)?).await {
+                    tracing::warn!("presence reply failed: {e}");
+                }
+            }
+            _ = online_tick.tick() => {
+                tracing::info!("{}", online_line(&registry.online()));
             }
             _ = backup_tick.tick() => {
                 if let (Some(due), Some(cfg)) = (backup_due, opts.backup_config.clone()) {
@@ -322,6 +401,18 @@ pub async fn run(
     }
     session.close().await?;
     Ok(())
+}
+
+/// How often the hub logs who is online.
+pub const ONLINE_LOG_EVERY: Duration = Duration::from_secs(600);
+
+/// `online: box, s24, towerx` (or `online: none`).
+pub fn online_line(devs: &[String]) -> String {
+    if devs.is_empty() {
+        "online: none".to_string()
+    } else {
+        format!("online: {}", devs.join(", "))
+    }
 }
 
 fn short(sha: &str) -> &str {

@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::io::Read;
 
-use vault_events::{agent, blob, claims, event, hub, key, net, vault};
+use vault_events::{agent, blob, claims, event, hub, key, net, presence, vault};
 
 #[derive(Parser)]
 #[command(
@@ -154,6 +154,9 @@ enum Cmd {
         connect: Vec<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Requester name sent as `from=` (shows in the hub log).
+        #[arg(long, default_value = net::CLI_REQUESTER)]
+        device: String,
     },
     /// Transfer diagnostics: pull one blob (`get`) or serve one file's
     /// chunks (`serve`) without touching any vault. `get` prints the timing.
@@ -166,6 +169,17 @@ enum Cmd {
         /// Only print counts.
         #[arg(long)]
         summary: bool,
+        /// Requester name sent as `from=` (shows in the hub log).
+        #[arg(long, default_value = net::CLI_REQUESTER)]
+        device: String,
+    },
+    /// Devices online now (presence tokens), with last-seen and build.
+    Peers {
+        #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
+        connect: Vec<String>,
+        /// Requester name sent as `from=` (shows in the hub log).
+        #[arg(long, default_value = net::CLI_REQUESTER)]
+        device: String,
     },
 }
 
@@ -186,6 +200,9 @@ enum BlobCmd {
         /// then the device, then anyone). Default: ask everyone.
         #[arg(long)]
         origin: Option<String>,
+        /// Requester name sent as `from=` (shows in the hub log).
+        #[arg(long, default_value = net::CLI_REQUESTER)]
+        device: String,
     },
     /// Time one raw query (all targets): replies and when it closes.
     Ping {
@@ -313,9 +330,13 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             };
             agent::run(opts, None).await
         }
-        Cmd::Index { connect, summary } => {
+        Cmd::Index {
+            connect,
+            summary,
+            device,
+        } => {
             let s = zenoh::open(net::client_config(&connect)?).await?;
-            let r = net::fetch_index(&s, Duration::from_secs(10)).await?;
+            let r = net::fetch_index(&s, &device, Duration::from_secs(10)).await?;
             s.close().await?;
             let Some(r) = r else {
                 return Err("no hub answered vault/hub/index".into());
@@ -428,6 +449,7 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             connect,
             out,
             origin,
+            device,
         }) => {
             if !event::is_sha256_hex(&sha256) {
                 return Err(format!("{sha256}: not a sha256").into());
@@ -436,8 +458,8 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let topts = blob::TransferOpts::from_env();
             let src = match &origin {
-                Some(o) => blob::ZenohSource::for_agent(s.clone(), &topts, o),
-                None => blob::ZenohSource::new(s.clone(), &topts),
+                Some(o) => blob::ZenohSource::for_agent(s.clone(), &topts, o, &device),
+                None => blob::ZenohSource::new(s.clone(), &topts, &device),
             };
             let tmp =
                 std::env::temp_dir().join(format!("vault-events-probe-{}", std::process::id()));
@@ -493,10 +515,17 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             let size = bytes.len();
             let s = zenoh::open(net::client_config(&connect)?).await?;
             let cache = Arc::new(blob::OutgoingCache::default());
-            cache.insert(&sha, bytes);
-            let server = blob::serve(&s, blob::Role::Agent(device), move |sha, i, cs| {
-                cache.chunk(sha, i, cs)
-            })
+            cache.insert_named(&sha, &file.display().to_string(), bytes);
+            let names = cache.clone();
+            let server = blob::serve(
+                &s,
+                blob::Role::Agent(device),
+                move |sha, i, cs| cache.chunk_sized(sha, i, cs),
+                move |sha| {
+                    let n = names.name(&sha);
+                    async move { n }
+                },
+            )
             .await?;
             println!("serving {sha} ({size} B) for {secs} s");
             tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -508,10 +537,11 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             path,
             connect,
             limit,
+            device,
         } => {
             key::validate_rel(&path).map_err(|e| format!("{path}: {e}"))?;
             let s = zenoh::open(net::client_config(&connect)?).await?;
-            let r = net::fetch_history(&s, &path, limit, Duration::from_secs(10)).await?;
+            let r = net::fetch_history(&s, &path, limit, &device, Duration::from_secs(10)).await?;
             s.close().await?;
             let Some(r) = r else {
                 return Err("no hub answered vault/hub/history (older hub build?)".into());
@@ -527,6 +557,44 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             }
             Ok(())
         }
+        Cmd::Peers { connect, device } => {
+            let s = zenoh::open(net::client_config(&connect)?).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let t = Duration::from_secs(5);
+            let reply = presence::fetch_hub_presence(&s, &device, t).await;
+            let lines = match reply {
+                Some(r) => {
+                    let mut out = vec![format!("hub {} ({})", r.hub, r.hub_build)];
+                    out.extend(peer_lines(&r.peers, r.now_ms));
+                    out
+                }
+                None => {
+                    // Older hub: ask the tokens and each device directly.
+                    let mut out =
+                        vec!["no hub presence reply (older hub?); live tokens:".to_string()];
+                    let mut peers = Vec::new();
+                    let now = event::now_ms();
+                    for d in presence::live_tokens(&s, t).await {
+                        let info = presence::fetch_info(&s, &d, &device, t).await;
+                        peers.push(presence::Peer {
+                            device: d,
+                            online: true,
+                            since_ms: info.as_ref().map(|i| i.started_ms).unwrap_or(now),
+                            last_seen_ms: now,
+                            info,
+                            tokens: 1,
+                        });
+                    }
+                    out.extend(peer_lines(&peers, now));
+                    out
+                }
+            };
+            s.close().await?;
+            for l in lines {
+                println!("{l}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -535,6 +603,70 @@ fn short(s: &str) -> &str {
 }
 
 /// `2026-11-19T20:59:41Z v5 nitro5 nitro5/external (external-edit) 2861 B sha 8f4343466 prev 1a2b..`
+/// `towerx  online   since 23:52:12Z (1h 3m)  agent vault-events 0.1.0+abc1234`
+fn peer_lines(peers: &[presence::Peer], now: u64) -> Vec<String> {
+    if peers.is_empty() {
+        return vec!["(no devices seen)".to_string()];
+    }
+    let w = peers.iter().map(|p| p.device.len()).max().unwrap_or(0);
+    let mut v: Vec<&presence::Peer> = peers.iter().collect();
+    v.sort_by(|a, b| b.online.cmp(&a.online).then(a.device.cmp(&b.device)));
+    v.into_iter()
+        .map(|p| {
+            let (state, at) = if p.online {
+                ("online ", format!("since {}", fmt_utc(p.since_ms)))
+            } else {
+                ("offline", format!("last seen {}", fmt_utc(p.last_seen_ms)))
+            };
+            let ago = if p.online {
+                now.saturating_sub(p.since_ms)
+            } else {
+                now.saturating_sub(p.last_seen_ms)
+            };
+            let build = p
+                .info
+                .as_ref()
+                .map(|i| format!("{} {}", i.role, i.build))
+                .unwrap_or_else(|| "build unknown".to_string());
+            format!(
+                "{:w$}  {state}  {at} ({} ago)  {build}",
+                p.device,
+                fmt_dur(ago)
+            )
+        })
+        .collect()
+}
+
+fn fmt_utc(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn fmt_dur(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
 fn who_line(e: &vault_events::history::HistoryEntry) -> String {
     let when = vault_rclone::sync::format_utc(e.stored_ms / 1000);
     let what = if e.deleted {

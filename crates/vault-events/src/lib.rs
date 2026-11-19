@@ -8,6 +8,7 @@
 //! - [`history`]: the hub's append-only per-path provenance log.
 //! - [`hub`]: embedded Zenoh router + storage queryables (+ Drive backup).
 //! - [`agent`]: `notify` watcher that publishes saves and applies events.
+//! - [`presence`]: liveliness tokens, `device online/offline`, `peers`.
 //!
 //! See the crate README for the topology and the box setup.
 
@@ -20,6 +21,7 @@ pub mod history;
 pub mod hub;
 pub mod key;
 pub mod net;
+pub mod presence;
 pub mod state;
 pub mod store;
 pub mod vault;

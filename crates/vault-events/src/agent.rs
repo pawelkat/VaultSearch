@@ -25,6 +25,7 @@ use crate::conflict::{self, Decision};
 use crate::event::{cause, now_ms, ConflictInfo, NoteEvent, Stamp};
 use crate::key;
 use crate::net;
+use crate::presence;
 use crate::state::AgentState;
 use crate::vault::{is_synced_path, may_contain_synced, Disk, VaultFs};
 
@@ -645,12 +646,14 @@ pub struct Link {
     pub transfer: TransferOpts,
     /// Partial downloads (`<state-dir>/partial`), outside the vault.
     pub partial_dir: PathBuf,
+    /// This device (`from=` on every query).
+    pub device: String,
 }
 
 impl Link {
     /// Chunk source for a file published by `origin`: hub, then `origin`.
     fn source(&self, origin: &str) -> ZenohSource {
-        ZenohSource::for_agent(self.session.clone(), &self.transfer, origin)
+        ZenohSource::for_agent(self.session.clone(), &self.transfer, origin, &self.device)
     }
 
     /// Fetch and verify the bytes of blob reference `ev`; returns the full
@@ -671,11 +674,16 @@ impl Link {
 /// afterwards keeps a second copy off the sender's (often slow) link.
 /// Returns `false` if the hub did not have it in time; the fetch then asks
 /// the sending device too.
-async fn wait_for_hub(session: &zenoh::Session, ev: &NoteEvent, wait: Duration) -> bool {
+async fn wait_for_hub(
+    session: &zenoh::Session,
+    from: &str,
+    ev: &NoteEvent,
+    wait: Duration,
+) -> bool {
     let t0 = std::time::Instant::now();
     loop {
         if let Ok(Some(stored)) =
-            net::fetch_note(session, &ev.stamp.path, Duration::from_secs(3)).await
+            net::fetch_note(session, &ev.stamp.path, from, Duration::from_secs(3)).await
         {
             if stored.stamp.sha256 == ev.stamp.sha256 || stored.stamp.beats(&ev.stamp) {
                 if t0.elapsed() > Duration::from_secs(1) {
@@ -736,8 +744,11 @@ async fn publish_all(link: &Link, evs: &[NoteEvent]) {
         let t = &link.transfer;
         let (wire, note) = match ev.to_blob_ref(t.inline_max, t.chunk_size) {
             Some(r) => {
-                link.cache
-                    .insert(&ev.stamp.sha256, ev.content.clone().unwrap_or_default());
+                link.cache.insert_named(
+                    &ev.stamp.sha256,
+                    &ev.stamp.path,
+                    ev.content.clone().unwrap_or_default(),
+                );
                 let b = r.blob.expect("blob ref");
                 let note = format!(
                     " as blob ({} B, {} chunks of {} B, sha256 {})",
@@ -794,13 +805,13 @@ pub async fn catch_up(
     timeout: Duration,
 ) -> Result<bool, net::BoxError> {
     let session = &link.session;
-    let Some(index) = net::fetch_index(session, timeout).await? else {
+    let Some(index) = net::fetch_index(session, &link.device, timeout).await? else {
         return Ok(false);
     };
     let (fetch, republish) = core.plan_catchup(&index.stamps);
     let (mut applied, mut conflicts) = (0usize, 0usize);
     for p in &fetch {
-        match net::fetch_note(session, p, timeout).await? {
+        match net::fetch_note(session, p, &link.device, timeout).await? {
             Some(mut ev) => {
                 if ev.is_blob_ref() && core.needs_bytes(&ev) {
                     match link.fetch_blob(&ev).await {
@@ -892,15 +903,29 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
         cache: Arc::new(OutgoingCache::default()),
         transfer: opts.transfer.clone(),
         partial_dir: opts.state_dir.join("partial"),
+        device: opts.device.clone(),
     };
+    // Online: `vault/presence/<device>` token + build info.
+    let _presence =
+        match presence::announce(&session, presence::this_build(&opts.device, "agent")).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("presence token not declared: {e}");
+                None
+            }
+        };
     // Our outgoing cache answers chunk queries on its own task, so a long
     // catch-up or fetch in the loop below never stalls a puller.
     let blob_server = {
-        let cache = link.cache.clone();
+        let (cache, names) = (link.cache.clone(), link.cache.clone());
         blob::serve(
             &session,
             blob::Role::Agent(opts.device.clone()),
-            move |sha, i, cs| cache.chunk(sha, i, cs),
+            move |sha, i, cs| cache.chunk_sized(sha, i, cs),
+            move |sha| {
+                let n = names.name(&sha);
+                async move { n }
+            },
         )
         .await?
     };
@@ -969,9 +994,9 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                                 ev.stamp.origin, b.size, b.chunks
                             );
                             let (src, dir, t, tx) = (link.source(&ev.stamp.origin), link.partial_dir.clone(), link.transfer.clone(), fetched_tx.clone());
-                            let session = session.clone();
+                            let (session, device) = (session.clone(), link.device.clone());
                             tokio::spawn(async move {
-                                wait_for_hub(&session, &ev, t.hub_wait).await;
+                                wait_for_hub(&session, &device, &ev, t.hub_wait).await;
                                 let r = match fetch_blob_with(&src, &dir, &t, &ev).await {
                                     Ok(full) => Some(full),
                                     Err(e) => {

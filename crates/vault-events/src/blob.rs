@@ -32,7 +32,7 @@
 //! rename. A hash mismatch discards the partial file and starts over; a
 //! partial file is never applied and never becomes a conflict copy.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -242,6 +242,16 @@ impl BlobDir {
     /// Chunk `i` at `chunk_size`, `None` if the blob is unknown or `i` is
     /// past the end.
     pub fn read_chunk(&self, sha: &str, i: u64, chunk_size: u64) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.read_chunk_sized(sha, i, chunk_size)?.map(|(b, _)| b))
+    }
+
+    /// Chunk `i` plus the whole blob's size.
+    pub fn read_chunk_sized(
+        &self,
+        sha: &str,
+        i: u64,
+        chunk_size: u64,
+    ) -> io::Result<Option<(Vec<u8>, u64)>> {
         if !is_sha256_hex(sha) {
             return Ok(None);
         }
@@ -257,7 +267,7 @@ impl BlobDir {
         f.seek(SeekFrom::Start(off))?;
         let mut buf = vec![0u8; len as usize];
         f.read_exact(&mut buf)?;
-        Ok(Some(buf))
+        Ok(Some((buf, size)))
     }
 
     pub fn remove(&self, sha: &str) -> io::Result<()> {
@@ -288,6 +298,8 @@ type CacheEntry = (String, Arc<Vec<u8>>, Instant);
 
 pub struct OutgoingCache {
     inner: Mutex<VecDeque<CacheEntry>>,
+    /// sha256 -> vault path, for the `served blob` log line.
+    names: Mutex<HashMap<String, String>>,
     max_bytes: u64,
     ttl: Duration,
 }
@@ -296,6 +308,7 @@ impl OutgoingCache {
     pub fn new(max_bytes: u64, ttl: Duration) -> Self {
         OutgoingCache {
             inner: Mutex::new(VecDeque::new()),
+            names: Mutex::new(HashMap::new()),
             max_bytes,
             ttl,
         }
@@ -311,6 +324,36 @@ impl OutgoingCache {
                 total -= b.len() as u64;
             }
         }
+    }
+
+    /// [`Self::insert`], remembering the vault path for log lines.
+    pub fn insert_named(&self, sha: &str, path: &str, bytes: Vec<u8>) {
+        self.insert(sha, bytes);
+        let live: BTreeSet<String> = self
+            .inner
+            .lock()
+            .expect("cache lock")
+            .iter()
+            .map(|(s, _, _)| s.clone())
+            .collect();
+        let mut n = self.names.lock().expect("names lock");
+        n.retain(|s, _| live.contains(s));
+        n.insert(sha.to_string(), path.to_string());
+    }
+
+    /// Vault path a cached blob was published for.
+    pub fn name(&self, sha: &str) -> Option<String> {
+        self.names.lock().expect("names lock").get(sha).cloned()
+    }
+
+    /// Chunk `i` plus the whole blob's size.
+    pub fn chunk_sized(&self, sha: &str, i: u64, chunk_size: u64) -> Option<(Vec<u8>, u64)> {
+        let b = self.get(sha)?;
+        let (off, len) = chunk_range(b.len() as u64, chunk_size, i)?;
+        Some((
+            b[off as usize..(off + len) as usize].to_vec(),
+            b.len() as u64,
+        ))
     }
 
     pub fn get(&self, sha: &str) -> Option<Arc<Vec<u8>>> {
@@ -603,26 +646,28 @@ pub struct ZenohSource {
     timeout: Duration,
     sources: Vec<String>,
     pref: AtomicUsize,
+    /// `from=` this device on every chunk query.
+    from: String,
 }
 
 impl ZenohSource {
     /// Ask everyone (diagnostics).
-    pub fn new(session: Session, opts: &TransferOpts) -> Self {
-        Self::with_sources(session, opts, &[SRC_ANY])
+    pub fn new(session: Session, opts: &TransferOpts, from: &str) -> Self {
+        Self::with_sources(session, opts, &[SRC_ANY], from)
     }
 
     /// An agent fetching a file published by `origin`: hub, then `origin`,
     /// then anyone.
-    pub fn for_agent(session: Session, opts: &TransferOpts, origin: &str) -> Self {
-        Self::with_sources(session, opts, &[SRC_HUB, origin, SRC_ANY])
+    pub fn for_agent(session: Session, opts: &TransferOpts, origin: &str, from: &str) -> Self {
+        Self::with_sources(session, opts, &[SRC_HUB, origin, SRC_ANY], from)
     }
 
     /// The hub pulling a file published by `origin`: `origin`, then anyone.
-    pub fn for_hub(session: Session, opts: &TransferOpts, origin: &str) -> Self {
-        Self::with_sources(session, opts, &[origin, SRC_ANY])
+    pub fn for_hub(session: Session, opts: &TransferOpts, origin: &str, from: &str) -> Self {
+        Self::with_sources(session, opts, &[origin, SRC_ANY], from)
     }
 
-    fn with_sources(session: Session, opts: &TransferOpts, srcs: &[&str]) -> Self {
+    fn with_sources(session: Session, opts: &TransferOpts, srcs: &[&str], from: &str) -> Self {
         let mut sources: Vec<String> = Vec::new();
         for s in srcs {
             if !s.is_empty() && !sources.iter().any(|x| x == s) {
@@ -634,6 +679,7 @@ impl ZenohSource {
             timeout: opts.chunk_timeout,
             sources,
             pref: AtomicUsize::new(0),
+            from: crate::net::clean_device(Some(from)),
         }
     }
 
@@ -680,7 +726,10 @@ impl ChunkSource for ZenohSource {
         let start = self.pref.load(AtomicOrdering::Relaxed) % n.max(1);
         for k in 0..n {
             let idx = (start + k) % n;
-            let sel = blob_selector_src(sha, i, chunk_size, &self.sources[idx]);
+            let sel = crate::net::with_from(
+                &blob_selector_src(sha, i, chunk_size, &self.sources[idx]),
+                &self.from,
+            );
             if let Some(b) = self.ask(&sel).await {
                 self.pref.store(idx, AtomicOrdering::Relaxed);
                 return Some(b);
@@ -690,68 +739,262 @@ impl ChunkSource for ZenohSource {
     }
 }
 
-/// Answer one chunk query with `lookup(sha, index, chunk_size)` if `role`
-/// is asked (`src`). Returns `(sha, index)` when a chunk was sent.
+/// One chunk sent by [`answer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Served {
+    pub sha: String,
+    pub index: u64,
+    pub len: u64,
+    /// Size of the whole blob.
+    pub size: u64,
+    pub chunk_size: u64,
+    /// Requester (`from` parameter) or `unknown`.
+    pub to: String,
+}
+
+/// Answer one chunk query with `lookup(sha, index, chunk_size)` -> `(chunk,
+/// blob size)` if `role` is asked (`src`).
 pub async fn answer(
     query: &zenoh::query::Query,
     role: &Role,
-    lookup: impl FnOnce(&str, u64, u64) -> Option<Vec<u8>>,
-) -> Option<(String, u64)> {
+    lookup: impl FnOnce(&str, u64, u64) -> Option<(Vec<u8>, u64)>,
+) -> Option<Served> {
     if !role.answers(query.parameters().get("src")) {
         return None;
     }
     let k = query.key_expr().as_str().to_string();
     let (sha, i) = parse_blob_key(&k)?;
     let cs = chunk_size_param(query.parameters().get("cs"));
-    let bytes = lookup(&sha, i, cs)?;
+    let (bytes, size) = lookup(&sha, i, cs)?;
+    let len = bytes.len() as u64;
+    let to = crate::net::requester(query);
     if let Err(e) = query.reply(k.as_str(), bytes).await {
-        tracing::debug!("blob reply {} failed: {e}", k);
+        tracing::debug!("blob reply {} to {to} failed: {e}", k);
         return None;
     }
-    Some((sha, i))
+    Some(Served {
+        sha,
+        index: i,
+        len,
+        size,
+        chunk_size: cs,
+        to,
+    })
+}
+
+/// A (requester, blob) transfer is summarised after this long without a
+/// chunk request.
+pub const SERVE_IDLE: Duration = Duration::from_secs(30);
+
+/// One `served blob ...` log line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServeSummary {
+    pub sha: String,
+    pub name: Option<String>,
+    pub to: String,
+    pub chunks: u64,
+    pub total: u64,
+    pub bytes: u64,
+    pub elapsed: Duration,
+    pub complete: bool,
+}
+
+impl ServeSummary {
+    /// `served blob e1936f74b612 (Notes/x.bin) to towerx: 10/10 chunks,
+    /// 2621440 B in 3.1 s` (or `partial 4/10 chunks, ... , idle`).
+    pub fn line(&self) -> String {
+        let name = self
+            .name
+            .as_ref()
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        let secs = self.elapsed.as_secs_f64();
+        if self.complete {
+            format!(
+                "served blob {}{name} to {}: {}/{} chunks, {} B in {secs:.1} s",
+                short(&self.sha),
+                self.to,
+                self.chunks,
+                self.total,
+                self.bytes
+            )
+        } else {
+            format!(
+                "served blob {}{name} to {}: partial {}/{} chunks, {} B in {secs:.1} s, idle",
+                short(&self.sha),
+                self.to,
+                self.chunks,
+                self.total,
+                self.bytes
+            )
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Transfer {
+    name: Option<String>,
+    first: Instant,
+    last: Instant,
+    have: BTreeSet<u64>,
+    bytes: u64,
+    total: u64,
+}
+
+/// Aggregates served chunks per (requester, blob) into one summary when
+/// every chunk was sent or the requester went quiet for [`SERVE_IDLE`].
+#[derive(Debug, Default)]
+pub struct ServeLog {
+    open: HashMap<(String, String), Transfer>,
+}
+
+impl ServeLog {
+    /// No transfer of `sha` to `to` in progress (the caller may look up a
+    /// name before [`Self::record`]).
+    pub fn is_new(&self, to: &str, sha: &str) -> bool {
+        !self.open.contains_key(&(to.to_string(), sha.to_string()))
+    }
+
+    /// Count one served chunk; returns the summary when this completed it.
+    pub fn record(
+        &mut self,
+        s: &Served,
+        name: Option<String>,
+        now: Instant,
+    ) -> Option<ServeSummary> {
+        let key = (s.to.clone(), s.sha.clone());
+        let t = self.open.entry(key.clone()).or_insert_with(|| Transfer {
+            name,
+            first: now,
+            last: now,
+            have: BTreeSet::new(),
+            bytes: 0,
+            total: chunk_count(s.size, s.chunk_size).max(1),
+        });
+        t.last = now;
+        t.bytes += s.len;
+        t.have.insert(s.index);
+        if (t.have.len() as u64) < t.total {
+            return None;
+        }
+        let t = self.open.remove(&key)?;
+        Some(Self::summary(key, t, true))
+    }
+
+    /// Summaries of transfers idle for `idle` or longer (removed).
+    pub fn sweep(&mut self, now: Instant, idle: Duration) -> Vec<ServeSummary> {
+        let done: Vec<(String, String)> = self
+            .open
+            .iter()
+            .filter(|(_, t)| now.saturating_duration_since(t.last) >= idle)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut out: Vec<ServeSummary> = done
+            .into_iter()
+            .filter_map(|k| {
+                let t = self.open.remove(&k)?;
+                Some(Self::summary(k, t, false))
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.to, &a.sha).cmp(&(&b.to, &b.sha)));
+        out
+    }
+
+    pub fn open_transfers(&self) -> usize {
+        self.open.len()
+    }
+
+    fn summary((to, sha): (String, String), t: Transfer, complete: bool) -> ServeSummary {
+        ServeSummary {
+            sha,
+            name: t.name,
+            to,
+            chunks: t.have.len() as u64,
+            total: t.total,
+            bytes: t.bytes,
+            elapsed: t.last.saturating_duration_since(t.first),
+            complete,
+        }
+    }
 }
 
 /// The running `vault/blob/**` queryable; dropping it stops serving.
 pub struct BlobServer {
     task: tokio::task::JoinHandle<()>,
+    sweeper: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for BlobServer {
     fn drop(&mut self) {
         self.task.abort();
+        self.sweeper.abort();
     }
 }
 
 /// Declare the `vault/blob/**` queryable and answer it on its own task,
 /// one reply task per query. A busy agent loop (catch-up, a fetch, a
 /// rescan) never delays a chunk, and pipelined requests are answered side
-/// by side.
-pub async fn serve<F>(session: &Session, role: Role, lookup: F) -> Result<BlobServer, zenoh::Error>
+/// by side. `lookup` gives `(chunk, blob size)`; `name` the vault path of
+/// a blob for the one `served blob ... to <requester>` line per transfer.
+pub async fn serve<F, N, Fut>(
+    session: &Session,
+    role: Role,
+    lookup: F,
+    name: N,
+) -> Result<BlobServer, zenoh::Error>
 where
-    F: Fn(&str, u64, u64) -> Option<Vec<u8>> + Send + Sync + 'static,
+    F: Fn(&str, u64, u64) -> Option<(Vec<u8>, u64)> + Send + Sync + 'static,
+    N: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<String>> + Send,
 {
     let q = session.declare_queryable(BLOB_WILDCARD).await?;
     let lookup = Arc::new(lookup);
+    let name = Arc::new(name);
     let role = Arc::new(role);
-    let task = tokio::spawn(async move {
-        while let Ok(query) = q.recv_async().await {
-            let (lookup, role) = (lookup.clone(), role.clone());
-            tokio::spawn(async move {
-                if let Some((sha, i)) = answer(&query, &role, |s, i, cs| lookup(s, i, cs)).await {
-                    if i == 0 {
-                        let from = match role.as_ref() {
-                            Role::Hub => "",
-                            Role::Agent(_) => " from the outgoing cache",
-                        };
-                        tracing::info!("serving blob {} (chunk 0){from}", short(&sha));
-                    } else {
-                        tracing::debug!("served blob {} chunk {i}", short(&sha));
+    let log = Arc::new(Mutex::new(ServeLog::default()));
+    let task = {
+        let log = log.clone();
+        tokio::spawn(async move {
+            while let Ok(query) = q.recv_async().await {
+                let (lookup, role, name, log) =
+                    (lookup.clone(), role.clone(), name.clone(), log.clone());
+                tokio::spawn(async move {
+                    let Some(s) = answer(&query, &role, |sh, i, cs| lookup(sh, i, cs)).await else {
+                        return;
+                    };
+                    tracing::debug!(
+                        "served blob {} chunk {} to {}",
+                        short(&s.sha),
+                        s.index,
+                        s.to
+                    );
+                    let new = log.lock().expect("serve log").is_new(&s.to, &s.sha);
+                    let label = if new { name(s.sha.clone()).await } else { None };
+                    let done = log
+                        .lock()
+                        .expect("serve log")
+                        .record(&s, label, Instant::now());
+                    if let Some(sum) = done {
+                        tracing::info!("{}", sum.line());
                     }
-                }
-            });
+                });
+            }
+        })
+    };
+    let sweeper = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let idle = log
+                .lock()
+                .expect("serve log")
+                .sweep(Instant::now(), SERVE_IDLE);
+            for sum in idle {
+                tracing::info!("{}", sum.line());
+            }
         }
     });
-    Ok(BlobServer { task })
+    Ok(BlobServer { task, sweeper })
 }
 
 fn short(sha: &str) -> &str {
@@ -1060,6 +1303,84 @@ mod tests {
         assert_eq!(
             dead.calls.load(Ordering::Relaxed),
             2 * (2 * DEFAULT_IN_FLIGHT as u64 - 1)
+        );
+    }
+
+    fn served(to: &str, sha: &str, i: u64, size: u64) -> Served {
+        let (_, len) = chunk_range(size, 4096, i).unwrap();
+        Served {
+            sha: sha.into(),
+            index: i,
+            len,
+            size,
+            chunk_size: 4096,
+            to: to.into(),
+        }
+    }
+
+    #[test]
+    fn serve_log_one_line_per_transfer() {
+        let sha = "e1936f74b612".to_string() + &"0".repeat(52);
+        let mut log = ServeLog::default();
+        let t0 = Instant::now();
+        let size = 10 * 4096 - 100; // 10 chunks
+                                    // towerx gets everything, with a duplicate request for chunk 3.
+        assert!(log.is_new("towerx", &sha));
+        for (n, i) in [0u64, 1, 2, 3, 3, 4, 5, 6, 7, 8].iter().enumerate() {
+            let at = t0 + Duration::from_millis(100 * n as u64);
+            assert_eq!(
+                log.record(
+                    &served("towerx", &sha, *i, size),
+                    Some("Notes/x.bin".into()),
+                    at
+                ),
+                None
+            );
+        }
+        assert!(!log.is_new("towerx", &sha));
+        // s24 asks for the same blob at the same time: a separate transfer.
+        log.record(&served("s24", &sha, 0, size), None, t0);
+        log.record(
+            &served("s24", &sha, 1, size),
+            None,
+            t0 + Duration::from_secs(1),
+        );
+        let done = log
+            .record(
+                &served("towerx", &sha, 9, size),
+                None,
+                t0 + Duration::from_millis(3100),
+            )
+            .unwrap();
+        assert!(done.complete);
+        assert_eq!((done.chunks, done.total), (10, 10));
+        assert_eq!(done.bytes, size + 4096, "duplicate chunk counted in bytes");
+        assert_eq!(
+            done.line(),
+            format!(
+                "served blob e1936f74b612 (Notes/x.bin) to towerx: 10/10 chunks, {} B in 3.1 s",
+                size + 4096
+            )
+        );
+        assert!(log.is_new("towerx", &sha), "closed");
+        // s24 goes quiet: one partial line after the idle time, not before.
+        assert!(log
+            .sweep(t0 + Duration::from_secs(20), SERVE_IDLE)
+            .is_empty());
+        let idle = log.sweep(t0 + Duration::from_secs(32), SERVE_IDLE);
+        assert_eq!(idle.len(), 1);
+        assert_eq!(
+            idle[0].line(),
+            "served blob e1936f74b612 to s24: partial 2/10 chunks, 8192 B in 1.0 s, idle"
+        );
+        assert_eq!(log.open_transfers(), 0);
+        // Unknown requester and a one-chunk blob.
+        let one = log
+            .record(&served("unknown", &sha, 0, 100), None, t0)
+            .unwrap();
+        assert_eq!(
+            one.line(),
+            "served blob e1936f74b612 to unknown: 1/1 chunks, 100 B in 0.0 s"
         );
     }
 

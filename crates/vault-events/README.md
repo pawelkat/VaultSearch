@@ -143,6 +143,41 @@ still go out inline (the old behaviour); new hubs and agents accept that.
   first (Zenoh query `vault/hub/history/<path>?limit=N`). Provenance never
   goes into note content.
 
+### Who is asking, who is online
+
+Every query carries `from=<device>` in its selector parameters next to
+`src=`/`cs=` (`vault/blob/<sha>/<i>?cs=262144;src=hub;from=towerx`,
+`vault/hub/index?from=s24`, ...). The CLI sends `--device` (default `cli`),
+the hub's own pulls `from=hub`. Servers that predate it ignore the
+parameter; queries without it are answered as before and logged as
+`unknown`. Labels are `[A-Za-z0-9._-]{1,64}`, anything else is `unknown`.
+
+The hub and agents log one line per (requester, blob) transfer instead of
+one per chunk, when the last chunk went out or after 30 s without a
+request:
+
+    served blob e1936f74b612 (Notes/x.bin) to towerx: 10/10 chunks, 2621440 B in 3.1 s
+    served blob e1936f74b612 (Notes/x.bin) to s24: partial 4/10 chunks, 1048576 B in 2.0 s, idle
+
+Catch-up index queries log `catch-up from towerx: 1057 listed`; note and
+history queries only at debug.
+
+Presence: each agent (and VaultHome) declares the liveliness token
+`vault/presence/<device>` and answers a queryable on the same key with
+`{device, role, build, started_ms}` (`build` = `vault-events
+<crate version>+<git short sha>` or `vaulthome <versionName>+<sha>`). The
+hub subscribes to the tokens and logs `device online: towerx`, `device
+<dev>: <role> <build>`, `device offline: towerx`, and every 10 minutes
+`online: box, s24, towerx`. It answers `vault/hub/presence` with every
+device it has seen (online, since, last seen, build):
+
+    $ vault-events peers [--connect tcp/host:7447]
+    hub box (vault-events 0.1.0+abc1234)
+    box     online   since 2026-11-19 23:52:12Z (1h03m ago)  agent vault-events 0.1.0+abc1234
+    towerx  offline  last seen 2026-11-19 22:10:00Z (2h45m ago)  agent vault-events 0.1.0+0fe5ac3
+
+Without a hub reply (older hub) `peers` lists the live tokens directly.
+
 ### Winner and conflict copies
 
 Total order, same on every device and on the hub (`Stamp::beats`):
