@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::io::Read;
 
-use vault_events::{agent, claims, event, hub, key, net, vault};
+use vault_events::{agent, blob, claims, event, hub, key, net, vault};
 
 #[derive(Parser)]
 #[command(
@@ -70,6 +70,13 @@ enum Cmd {
         /// Run the backup as `--dry-run` only.
         #[arg(long)]
         backup_dry_run: bool,
+        /// Files larger than this (bytes) travel as a blob reference plus
+        /// chunks pulled over Zenoh queries instead of one inline message.
+        #[arg(long, env = "VAULT_EVENTS_INLINE_MAX", default_value_t = blob::DEFAULT_INLINE_MAX)]
+        inline_max: u64,
+        /// Chunk size (bytes) for blob transfers.
+        #[arg(long, env = "VAULT_EVENTS_CHUNK_SIZE", default_value_t = blob::DEFAULT_CHUNK_SIZE)]
+        chunk_size: u64,
     },
     /// Watch a vault folder, publish local saves, apply incoming events.
     Agent {
@@ -109,6 +116,13 @@ enum Cmd {
         /// Do not look for a bisync marker (hosts without Drive bisync).
         #[arg(long)]
         no_bisync_marker: bool,
+        /// Files larger than this (bytes) travel as a blob reference plus
+        /// chunks pulled over Zenoh queries instead of one inline message.
+        #[arg(long, env = "VAULT_EVENTS_INLINE_MAX", default_value_t = blob::DEFAULT_INLINE_MAX)]
+        inline_max: u64,
+        /// Chunk size (bytes) for blob transfers.
+        #[arg(long, env = "VAULT_EVENTS_CHUNK_SIZE", default_value_t = blob::DEFAULT_CHUNK_SIZE)]
+        chunk_size: u64,
     },
     /// Write (or delete) one note as a named writer: reads the content from
     /// stdin, writes it atomically, and leaves a claim so the running agent
@@ -150,6 +164,15 @@ enum Cmd {
     },
 }
 
+fn transfer_opts(inline_max: u64, chunk_size: u64) -> blob::TransferOpts {
+    blob::TransferOpts {
+        inline_max,
+        chunk_size,
+        ..Default::default()
+    }
+    .normalized()
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -182,6 +205,8 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             backup_config,
             backup_interval,
             backup_dry_run,
+            inline_max,
+            chunk_size,
         } => {
             let opts = hub::HubOpts {
                 data_dir: data_dir.unwrap_or_else(|| default_share().join("hub")),
@@ -191,6 +216,7 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 backup_config,
                 backup_interval: Duration::from_secs(backup_interval),
                 backup_dry_run,
+                transfer: transfer_opts(inline_max, chunk_size),
             };
             hub::run(opts, None).await
         }
@@ -208,6 +234,8 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             program,
             bisync_marker_dir,
             no_bisync_marker,
+            inline_max,
+            chunk_size,
         } => {
             if !claims::valid_writer_name(&program) {
                 return Err(format!("--program {program:?}: use [A-Za-z0-9._-], max 32").into());
@@ -239,6 +267,7 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 query_timeout: Duration::from_secs(20),
                 program,
                 bisync_marker_dir,
+                transfer: transfer_opts(inline_max, chunk_size),
             };
             agent::run(opts, None).await
         }

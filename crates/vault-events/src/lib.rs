@@ -1,6 +1,7 @@
 //! Event-based vault sync over [Zenoh](https://zenoh.io) (stage 1).
 //!
 //! - [`event`]: the versioned wire format of one note change.
+//! - [`blob`]: chunked transfer of files above the inline limit.
 //! - [`key`]: vault path <-> `vault/notes/<path>` key expressions.
 //! - [`conflict`]: who wins, and the conflict-copy name for the loser.
 //! - [`store`]: the hub's persisted latest state per note.
@@ -11,6 +12,7 @@
 //! See the crate README for the topology and the box setup.
 
 pub mod agent;
+pub mod blob;
 pub mod claims;
 pub mod conflict;
 pub mod event;

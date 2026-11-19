@@ -13,11 +13,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+use crate::blob::{self, OutgoingCache, TransferOpts, ZenohSource};
 use crate::claims;
 use crate::conflict::{self, Decision};
 use crate::event::{cause, now_ms, ConflictInfo, NoteEvent, Stamp};
@@ -162,6 +164,14 @@ impl AgentCore {
             local_ts,
         );
         out.decision = Some(d.clone());
+        if ev.is_blob_ref() && decision_needs_bytes(&d) {
+            // Never apply (or save as a conflict copy) a file whose bytes
+            // have not been fetched and verified.
+            return Err(io::Error::other(format!(
+                "{path}: blob {} not fetched yet",
+                short(&ev.stamp.sha256)
+            )));
+        }
         let inc = &ev.stamp;
         match d {
             Decision::Ignore => {}
@@ -215,12 +225,38 @@ impl AgentCore {
                     stamp: local.clone(),
                     content,
                     conflict: None,
+                    blob: None,
                 };
                 self.record(local);
                 out.publish.push(ev);
             }
         }
         Ok(out)
+    }
+
+    /// Whether applying blob reference `ev` needs its bytes (it would be
+    /// written, or saved as a conflict copy). `false`: the stamp alone is
+    /// enough (ignored, or the disk already holds these bytes).
+    pub fn needs_bytes(&self, ev: &NoteEvent) -> bool {
+        if !is_synced_path(&ev.stamp.path) {
+            return false;
+        }
+        let disk = match self.fs.read(&ev.stamp.path) {
+            Ok(Disk::Skipped(_)) | Err(_) => return false,
+            Ok(d) => d,
+        };
+        let local_ts = match &disk {
+            Disk::Present { mtime_ms, .. } => *mtime_ms,
+            _ => now_ms(),
+        };
+        let d = conflict::decide(
+            self.state.stamp(&ev.stamp.path),
+            disk.sha(),
+            &ev.stamp,
+            &self.device,
+            local_ts,
+        );
+        decision_needs_bytes(&d)
     }
 
     /// Save the losing bytes under a conflict name and publish the copy.
@@ -483,6 +519,7 @@ impl AgentCore {
                 stamp: st,
                 content: None,
                 conflict: None,
+                blob: None,
             })),
             (Disk::Present { sha256, bytes, .. }, false) if sha256 == st.sha256 => {
                 Ok(Some(NoteEvent {
@@ -490,12 +527,24 @@ impl AgentCore {
                     stamp: st,
                     content: Some(bytes),
                     conflict: None,
+                    blob: None,
                 }))
             }
             (Disk::Skipped(_), _) => Ok(None),
             _ => self.on_local(rel),
         }
     }
+}
+
+fn decision_needs_bytes(d: &Decision) -> bool {
+    matches!(
+        d,
+        Decision::Apply { .. }
+            | Decision::KeepLocal {
+                save_incoming_as: Some(_),
+                ..
+            }
+    )
 }
 
 /// Watcher events that can change what is on disk. Access events (open,
@@ -525,6 +574,53 @@ pub struct AgentOpts {
     /// vault-rclone marker directory (`~/.local/share/vault-rclone`); `None`
     /// = no bisync on this host.
     pub bisync_marker_dir: Option<PathBuf>,
+    /// Inline limit and chunking for large files.
+    pub transfer: TransferOpts,
+}
+
+/// The agent's network side: session, outgoing blob cache, chunk settings.
+pub struct Link {
+    pub session: zenoh::Session,
+    pub cache: Arc<OutgoingCache>,
+    pub transfer: TransferOpts,
+    /// Partial downloads (`<state-dir>/partial`), outside the vault.
+    pub partial_dir: PathBuf,
+}
+
+impl Link {
+    fn source(&self) -> ZenohSource {
+        ZenohSource {
+            session: self.session.clone(),
+            timeout: self.transfer.chunk_timeout,
+        }
+    }
+
+    /// Fetch and verify the bytes of blob reference `ev`; returns the full
+    /// event.
+    pub async fn fetch_blob(&self, ev: &NoteEvent) -> Result<NoteEvent, net::BoxError> {
+        fetch_blob_with(&self.source(), &self.partial_dir, &self.transfer, ev).await
+    }
+}
+
+async fn fetch_blob_with(
+    src: &ZenohSource,
+    partial_dir: &Path,
+    transfer: &TransferOpts,
+    ev: &NoteEvent,
+) -> Result<NoteEvent, net::BoxError> {
+    let info = ev.blob.ok_or("not a blob reference")?;
+    let f = blob::fetch(src, partial_dir, &ev.stamp.sha256, &info, transfer).await?;
+    tracing::info!(
+        "fetched blob {} for {}: {} B, {} chunks in {} ms ({} resumed, {} retried), sha256 ok",
+        short(&ev.stamp.sha256),
+        ev.stamp.path,
+        f.bytes.len(),
+        f.chunks,
+        f.elapsed.as_millis(),
+        f.resumed,
+        f.retries
+    );
+    Ok(ev.with_content(f.bytes)?)
 }
 
 pub fn state_file(state_dir: &Path) -> PathBuf {
@@ -534,10 +630,29 @@ pub fn state_file(state_dir: &Path) -> PathBuf {
 /// Shared handle for tests: lets a caller stop the agent loop.
 pub type Shutdown = tokio::sync::watch::Receiver<bool>;
 
-async fn publish_all(session: &zenoh::Session, evs: &[NoteEvent]) {
+/// Publish events; content above the inline limit goes out as a blob
+/// reference and stays in the outgoing cache for the hub to pull.
+async fn publish_all(link: &Link, evs: &[NoteEvent]) {
     for ev in evs {
-        match net::publish(session, ev).await {
-            Ok(()) => tracing::info!("{}", published_line(ev)),
+        let t = &link.transfer;
+        let (wire, note) = match ev.to_blob_ref(t.inline_max, t.chunk_size) {
+            Some(r) => {
+                link.cache
+                    .insert(&ev.stamp.sha256, ev.content.clone().unwrap_or_default());
+                let b = r.blob.expect("blob ref");
+                let note = format!(
+                    " as blob ({} B, {} chunks of {} B, sha256 {})",
+                    b.size,
+                    b.chunks,
+                    b.chunk_size,
+                    short(&ev.stamp.sha256)
+                );
+                (r, note)
+            }
+            None => (ev.clone(), String::new()),
+        };
+        match net::publish(&link.session, &wire).await {
+            Ok(()) => tracing::info!("{}{note}", published_line(ev)),
             Err(e) => tracing::warn!("publish {} failed: {e}", ev.stamp.path),
         }
     }
@@ -576,9 +691,10 @@ pub fn published_line(ev: &NoteEvent) -> String {
 /// One catch-up pass against the hub. Returns `false` if no hub answered.
 pub async fn catch_up(
     core: &mut AgentCore,
-    session: &zenoh::Session,
+    link: &Link,
     timeout: Duration,
 ) -> Result<bool, net::BoxError> {
+    let session = &link.session;
     let Some(index) = net::fetch_index(session, timeout).await? else {
         return Ok(false);
     };
@@ -586,14 +702,25 @@ pub async fn catch_up(
     let (mut applied, mut conflicts) = (0usize, 0usize);
     for p in &fetch {
         match net::fetch_note(session, p, timeout).await? {
-            Some(ev) => {
+            Some(mut ev) => {
+                if ev.is_blob_ref() && core.needs_bytes(&ev) {
+                    match link.fetch_blob(&ev).await {
+                        Ok(full) => ev = full,
+                        Err(e) => {
+                            tracing::warn!(
+                                "catch-up: blob for {p} not fetched: {e}; next pass retries"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 let a = core.on_incoming(&ev)?;
                 if a.changed {
                     tracing::info!("catch-up: {}", applied_line(&ev));
                 }
                 applied += usize::from(a.changed);
                 conflicts += a.conflicts.len();
-                publish_all(session, &a.publish).await;
+                publish_all(link, &a.publish).await;
             }
             None => tracing::warn!("catch-up: hub listed {p} but returned nothing"),
         }
@@ -604,7 +731,7 @@ pub async fn catch_up(
             out.push(ev);
         }
     }
-    publish_all(session, &out).await;
+    publish_all(link, &out).await;
     core.save_if_dirty()?;
     tracing::info!(
         "catch-up from hub {}: {} stored, fetched {}, applied {}, conflicts {}, republished {}",
@@ -654,11 +781,23 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
         }
     };
     tracing::info!(
-        "agent {} on {} connected to {:?}",
+        "agent {} on {} connected to {:?}; files > {} B travel as blobs ({} B chunks)",
         opts.device,
         vault.display(),
-        opts.connect
+        opts.connect,
+        opts.transfer.inline_max,
+        opts.transfer.chunk_size
     );
+    let link = Link {
+        session: session.clone(),
+        cache: Arc::new(OutgoingCache::default()),
+        transfer: opts.transfer.clone(),
+        partial_dir: opts.state_dir.join("partial"),
+    };
+    let blob_q = session.declare_queryable(blob::BLOB_WILDCARD).await?;
+    // Finished blob fetches: (path+sha, full event if fetched).
+    let (fetched_tx, mut fetched_rx) = mpsc::unbounded_channel::<(String, Option<NoteEvent>)>();
+    let mut fetching: HashSet<String> = HashSet::new();
 
     let sub = session
         .declare_subscriber(key::NOTES_WILDCARD)
@@ -681,14 +820,14 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
 
     // Remote first, then local: incoming changes are applied (with conflict
     // copies) before offline local edits are published.
-    match catch_up(&mut core, &session, opts.query_timeout).await {
+    match catch_up(&mut core, &link, opts.query_timeout).await {
         Ok(true) => {}
         Ok(false) => tracing::warn!("no hub answered the catch-up query; will retry"),
         Err(e) => tracing::warn!("catch-up failed: {e}"),
     }
     let b = core.scan()?;
     core.seeding = false;
-    publish_all(&session, &b.publish).await;
+    publish_all(&link, &b.publish).await;
     core.save_if_dirty()?;
     tracing::info!("initial scan: published {}", b.publish.len());
 
@@ -711,18 +850,66 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                 let k = sample.key_expr().as_str().to_string();
                 let bytes = sample.payload().to_bytes();
                 match NoteEvent::decode(&bytes, Some(&k)) {
+                    Ok(ev) if ev.is_blob_ref() && core.needs_bytes(&ev) => {
+                        let id = format!("{}\n{}", ev.stamp.path, ev.stamp.sha256);
+                        if fetching.insert(id.clone()) {
+                            let b = ev.blob.expect("blob ref");
+                            tracing::info!(
+                                "fetching blob {} for {} v{} from {}: {} B in {} chunks",
+                                short(&ev.stamp.sha256), ev.stamp.path, ev.stamp.version,
+                                ev.stamp.origin, b.size, b.chunks
+                            );
+                            let (src, dir, t, tx) = (link.source(), link.partial_dir.clone(), link.transfer.clone(), fetched_tx.clone());
+                            tokio::spawn(async move {
+                                let r = match fetch_blob_with(&src, &dir, &t, &ev).await {
+                                    Ok(full) => Some(full),
+                                    Err(e) => {
+                                        tracing::warn!("blob for {} not fetched: {e}; catch-up retries", ev.stamp.path);
+                                        None
+                                    }
+                                };
+                                let _ = tx.send((id, r));
+                            });
+                        }
+                    }
                     Ok(ev) => match core.on_incoming(&ev) {
                         Ok(a) => {
                             if a.changed {
                                 tracing::info!("{}", applied_line(&ev));
                             }
-                            publish_all(&session, &a.publish).await;
+                            publish_all(&link, &a.publish).await;
                         }
                         Err(e) => tracing::error!("apply {} failed: {e}", ev.stamp.path),
                     },
                     Err(e) => tracing::warn!("dropping bad event on {k}: {e}"),
                 }
                 core.save_if_dirty()?;
+            }
+            Some((id, done)) = fetched_rx.recv() => {
+                fetching.remove(&id);
+                if let Some(ev) = done {
+                    match core.on_incoming(&ev) {
+                        Ok(a) => {
+                            if a.changed {
+                                tracing::info!("{}", applied_line(&ev));
+                            }
+                            publish_all(&link, &a.publish).await;
+                        }
+                        Err(e) => tracing::error!("apply {} failed: {e}", ev.stamp.path),
+                    }
+                    core.save_if_dirty()?;
+                }
+            }
+            q = blob_q.recv_async() => {
+                let Ok(query) = q else { break };
+                let cache = link.cache.clone();
+                if let Some((sha, i)) = blob::answer(&query, |sha, i, cs| cache.chunk(sha, i, cs)).await {
+                    if i == 0 {
+                        tracing::info!("serving blob {} (chunk 0) from the outgoing cache", short(&sha));
+                    } else {
+                        tracing::debug!("served blob {} chunk {i}", short(&sha));
+                    }
+                }
             }
             Some(p) = rx.recv() => {
                 tracing::trace!("watch: {}", p.display());
@@ -753,11 +940,11 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
             _ = &mut debounce, if !pending.is_empty() => {
                 let batch = std::mem::take(&mut pending);
                 let b = core.local_batch(&batch)?;
-                publish_all(&session, &b.publish).await;
+                publish_all(&link, &b.publish).await;
                 core.save_if_dirty()?;
             }
             _ = catchup_tick.tick() => {
-                if let Err(e) = catch_up(&mut core, &session, opts.query_timeout).await {
+                if let Err(e) = catch_up(&mut core, &link, opts.query_timeout).await {
                     tracing::warn!("catch-up failed: {e}");
                 }
             }
@@ -766,14 +953,14 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                 if !b.publish.is_empty() {
                     tracing::info!("rescan found {} unpublished local changes", b.publish.len());
                 }
-                publish_all(&session, &b.publish).await;
+                publish_all(&link, &b.publish).await;
                 core.save_if_dirty()?;
             }
             _ = link_tick.tick() => {
                 let n = net::router_count(&session).await;
                 if n > 0 && routers == 0 {
                     tracing::info!("hub link up; catching up");
-                    if let Err(e) = catch_up(&mut core, &session, opts.query_timeout).await {
+                    if let Err(e) = catch_up(&mut core, &link, opts.query_timeout).await {
                         tracing::warn!("catch-up failed: {e}");
                     }
                 } else if n == 0 && routers > 0 {
@@ -793,6 +980,8 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
     }
     core.save_if_dirty()?;
     drop(watcher);
+    drop(blob_q);
+    drop(link);
     session.close().await?;
     Ok(())
 }
@@ -1181,5 +1370,53 @@ mod tests {
             applied_line(&e),
             "applied a.md v4 from nitro5 by nitro5/external (external-edit)"
         );
+    }
+
+    #[test]
+    fn blob_reference_is_never_applied_without_bytes() {
+        let a = tempfile::tempdir().unwrap();
+        let mut c = core(a.path(), "box");
+        let big = vec![9u8; 5000];
+        let full = NoteEvent::put("Daily/p.jpg", big.clone(), "nitro5", 1, None, 1);
+        let r = full.to_blob_ref(1000, 4096).unwrap();
+        assert!(c.needs_bytes(&r));
+        assert!(c.on_incoming(&r).is_err(), "no partial or empty write");
+        assert!(!a.path().join("Daily/p.jpg").exists());
+        assert!(conflict_copies_in(a.path()).is_empty());
+        // With the fetched bytes it applies normally.
+        let filled = r.with_content(big.clone()).unwrap();
+        assert!(c.on_incoming(&filled).unwrap().changed);
+        assert_eq!(std::fs::read(a.path().join("Daily/p.jpg")).unwrap(), big);
+        // Same state again: the stamp alone is enough, nothing to fetch.
+        assert!(!c.needs_bytes(&r));
+        assert_eq!(c.on_incoming(&r).unwrap().decision, Some(Decision::Ignore));
+        // Disk already holds the bytes (e.g. Drive got there first): adopt.
+        let b = tempfile::tempdir().unwrap();
+        let mut c2 = core(b.path(), "s24");
+        c2.fs.write_atomic("Daily/p.jpg", &big).unwrap();
+        assert!(!c2.needs_bytes(&r));
+        assert_eq!(c2.on_incoming(&r).unwrap().decision, Some(Decision::Adopt));
+    }
+
+    fn conflict_copies_in(dir: &Path) -> Vec<String> {
+        walk(dir)
+            .into_iter()
+            .filter(|n| n.contains(" (conflict "))
+            .collect()
+    }
+
+    fn walk(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walk(&p));
+                } else {
+                    out.push(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        out
     }
 }

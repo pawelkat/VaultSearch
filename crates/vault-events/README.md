@@ -54,9 +54,57 @@ Payload: JSON.
 | `cause` | Optional. `local-edit`, `external-edit`, `bisync-pull`, `event-apply-republish`, `conflict-copy`, `delete`, `catchup-republish`, `seed`. |
 | `content` | File bytes, base64. |
 | `conflict` | Optional, conflict copies only: `{of, winner_sha256, winner_size, winner_origin, loser_sha256, loser_size, loser_origin}`. |
+| `blob` | Optional, instead of `content` for files above the inline limit: `{size, chunk_size, chunks}`. See "Large files". |
 
 `writer`, `cause` and `conflict` are new optional fields in format 1: older
 builds ignore them and events without them still decode (`-` in logs).
+
+### Large files (blob references + chunks)
+
+One Zenoh message per file broke on photos: a 4.9 MB or 7 MB event filled
+the session's non-droppable queue and dropped the link (`Unable to push non
+droppable network message`). Files above `--inline-max`
+(`VAULT_EVENTS_INLINE_MAX`, default 1 MiB) now travel in two parts:
+
+1. The event on `vault/notes/<path>` carries the stamp (with the whole
+   file's `sha256`) and `blob: {size, chunk_size, chunks}`, no `content`.
+   It is a few hundred bytes.
+2. The bytes are pulled with Zenoh queries on
+   `vault/blob/<sha256>/<index>?cs=<chunk_size>` (`--chunk-size` /
+   `VAULT_EVENTS_CHUNK_SIZE`, default 256 KiB). Queries ask for
+   `Priority::DataLow` and `CongestionControl::Drop`, and replies inherit
+   both, so bulk bytes never block note events; a dropped reply is a
+   missing chunk that is asked for again.
+
+Who serves chunks: the hub, from `<data-dir>/blobs/<sha256>` (required), and
+the sending agent, from an in-memory cache of what it published in the last
+30 minutes (max 256 MiB). Receivers ask the best-matching queryable first,
+then all of them.
+
+Hub ingest is pull-based: the hub gets the reference, pulls the chunks from
+the sender's queryable, checks the SHA-256, and only then stores the entry
+(and logs `pulled blob ... sha256 ok`, then `stored ... [blob N B, sha256
+...]`). The sender never puts the whole file. If the pull fails (sender gone),
+nothing is stored, so the hub index lacks the state and the sender republishes
+it on its next catch-up. Inline large events from older agents are accepted
+and moved into the blob store, and older hub stores are converted on start,
+so catch-up replies are always small.
+
+Receivers (agents, and the hub when pulling) assemble chunks in
+`<state-dir>/partial/<sha256>.part` (+ `.have`, the finished chunk list),
+outside the vault, so the watcher, Obsidian and rclone bisync never see a
+partial file. A retry or a restart asks only for missing chunks. A SHA-256
+mismatch discards the partial file and starts over. Only verified bytes reach
+the normal apply path, which writes with a same-directory temp file + rename.
+A reference whose bytes were not fetched is never applied and never becomes a
+conflict copy. Catch-up uses the same path for big files.
+
+Older builds (no `blob` field) see a live event without `content` and drop
+it as `MissingContent` (`dropping bad event ... live event without content`
+live, `bad catch-up reply ... ` + `hub listed <path> but returned nothing` on
+catch-up): no file is written, nothing is deleted, and the file reaches
+those devices only after they update (or via Drive). Their own large files
+still go out inline (the old behaviour); new hubs and agents accept that.
 
 ### Who wrote it
 
@@ -119,8 +167,9 @@ bisync's own conflict losers (`*.conflict-*`, `*..conflict-*`, `*.conflictN`;
 each bisync device makes its own, and syncing them spread them to every
 device), and the agent's own `.vault-events-tmp-*` files do not. The agent's
 own `(conflict <origin> <date>)` copies do sync. A conflict copy is never
-made when both sides hold the same bytes. Large attachments stay on the
-Drive fallback path.
+made when both sides hold the same bytes. Files above the inline limit
+(1 MiB) up to `--max-bytes` sync as blob references plus chunks; larger
+files stay on the Drive fallback path.
 
 ## Hub
 
@@ -291,4 +340,12 @@ events and over Drive. This crate does **not** read it yet; the box hub's dial-o
   vaults: edit A -> B, B -> A in a new folder, delete propagates, no echo
   (hub version stable), B offline then catches up from hub storage, concurrent
   offline edit -> winner at live path + `(conflict dev-b <date>)` copy on both
-  sides, hub restart keeps storage.
+  sides, hub restart keeps storage; a 7 MB photo A -> hub -> B in 256 KiB
+  chunks (hub stores a small reference + a blob with the right hash, notes
+  still sync both ways afterwards, no conflict or partial files), and a late
+  joiner gets it from the hub alone after the sender stopped.
+- Unit (blob): chunk math and keys, out-of-order assembly, resume after a
+  restart (only missing chunks asked again), hash mismatch -> discard and
+  refetch, a source that always lies never yields bytes, outgoing cache
+  limits, the hub's blob store and conversion of older inline entries, and
+  that a reference is never applied without verified bytes.

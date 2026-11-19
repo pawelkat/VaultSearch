@@ -38,6 +38,7 @@ fn start_hub(data: &Path, port: u16) -> Running {
         backup_config: None,
         backup_interval: Duration::from_secs(60),
         backup_dry_run: true,
+        transfer: Default::default(),
     };
     let task = tokio::spawn(async move {
         hub::run(opts, Some(rx)).await.expect("hub");
@@ -56,13 +57,24 @@ fn start_agent_with(
     port: u16,
     bisync_marker_dir: Option<PathBuf>,
 ) -> Running {
+    start_agent_opts(vault, state, device, port, bisync_marker_dir, 1 << 20)
+}
+
+fn start_agent_opts(
+    vault: &Path,
+    state: &Path,
+    device: &str,
+    port: u16,
+    bisync_marker_dir: Option<PathBuf>,
+    max_bytes: u64,
+) -> Running {
     let (tx, rx) = watch::channel(false);
     let opts = agent::AgentOpts {
         vault: vault.to_path_buf(),
         device: device.into(),
         state_dir: state.to_path_buf(),
         connect: vec![format!("tcp/127.0.0.1:{port}")],
-        max_bytes: 1 << 20,
+        max_bytes,
         max_delete: 50,
         min_files: 0,
         debounce: Duration::from_millis(150),
@@ -71,6 +83,7 @@ fn start_agent_with(
         query_timeout: Duration::from_secs(5),
         program: agent::DEFAULT_PROGRAM.into(),
         bisync_marker_dir,
+        transfer: Default::default(),
     };
     let task = tokio::spawn(async move {
         agent::run(opts, Some(rx)).await.expect("agent");
@@ -350,5 +363,133 @@ async fn writer_cause_and_history() {
     let hub = start_hub(&hub_dir, port);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(history(port, "Notes/w.md").await.len(), 3);
+    hub.stop().await;
+}
+
+/// Deterministic, incompressible-looking bytes (xorshift).
+fn photo_bytes(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+fn sha_of(p: &Path) -> Option<String> {
+    std::fs::read(p).ok().map(|b| event::sha256_hex(&b))
+}
+
+fn all_files(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(all_files(&p));
+            } else {
+                out.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A 7 MB photo goes A -> hub -> B as a blob reference plus 256 KiB
+/// chunks, the sessions stay up (a small note still syncs afterwards), and
+/// a device joining later gets it from the hub alone via catch-up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_file_travels_in_chunks() {
+    let root = tempfile::tempdir().unwrap();
+    let p = |n: &str| root.path().join(n);
+    let (hub_dir, va, vb, vc) = (p("hub"), p("vault-a"), p("vault-b"), p("vault-c"));
+    for d in [&va, &vb, &vc] {
+        std::fs::create_dir_all(d.join("Daily")).unwrap();
+    }
+    let port = free_port();
+    let hub = start_hub(&hub_dir, port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let big_max = 16 << 20;
+    let a = start_agent_opts(&va, &p("state-a"), "nitro5", port, None, big_max);
+    let b = start_agent_opts(&vb, &p("state-b"), "s24", port, None, big_max);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let photo = photo_bytes(7_000_000, 42);
+    let sha = event::sha256_hex(&photo);
+    let rel = "Daily/2026-11-19-photo.jpg";
+    // Saved like a camera/sync app would: temp file, then rename.
+    std::fs::write(va.join("Daily/.incoming"), &photo).unwrap();
+    std::fs::rename(va.join("Daily/.incoming"), va.join(rel)).unwrap();
+    let big_t = Duration::from_secs(60);
+    wait_for("7 MB photo on B", big_t, || {
+        sha_of(&vb.join(rel)).as_deref() == Some(sha.as_str())
+    })
+    .await;
+
+    // The hub stores a reference plus the blob, whose bytes hash right.
+    let s = zenoh::open(net::client_config(&[format!("tcp/127.0.0.1:{port}")]).unwrap())
+        .await
+        .unwrap();
+    let idx = net::fetch_index(&s, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap();
+    let st = idx.stamps.iter().find(|s| s.path == rel).unwrap();
+    assert_eq!(st.sha256, sha);
+    let stored = net::fetch_note(&s, rel, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.is_blob_ref(), "catch-up reply is small");
+    assert_eq!(stored.blob.unwrap().size, 7_000_000);
+    assert!(
+        stored.encode().len() < 2048,
+        "reference is {} B",
+        stored.encode().len()
+    );
+    s.close().await.unwrap();
+    assert_eq!(
+        sha_of(&hub_dir.join("blobs").join(&sha)).as_deref(),
+        Some(sha.as_str())
+    );
+
+    // Sessions survived: small notes still sync both ways.
+    std::fs::write(vb.join("Daily/after.md"), "still linked\n").unwrap();
+    wait_for("note B -> A after the photo", T, || {
+        read(va.join("Daily/after.md")).as_deref() == Some("still linked\n")
+    })
+    .await;
+    std::fs::write(va.join("Daily/after2.md"), "and back\n").unwrap();
+    wait_for("note A -> B after the photo", T, || {
+        read(vb.join("Daily/after2.md")).as_deref() == Some("and back\n")
+    })
+    .await;
+
+    // No conflict copies, no partial or temp files left in the vaults.
+    for v in [&va, &vb] {
+        let files = all_files(v);
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.contains(" (conflict ") && !f.contains(".vault-events-tmp-")),
+            "{files:?}"
+        );
+    }
+    assert!(all_files(&p("state-b").join("partial")).is_empty());
+
+    // The sender goes away; a new device still gets the photo from the hub.
+    a.stop().await;
+    let c = start_agent_opts(&vc, &p("state-c"), "towerx", port, None, big_max);
+    wait_for("photo on late joiner C via catch-up", big_t, || {
+        sha_of(&vc.join(rel)).as_deref() == Some(sha.as_str())
+    })
+    .await;
+    assert!(conflict_copies(&vc.join("Daily")).is_empty());
+
+    c.stop().await;
+    b.stop().await;
     hub.stop().await;
 }

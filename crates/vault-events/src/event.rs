@@ -5,6 +5,13 @@
 //! guessing. File bytes travel base64-encoded in `content` so binary
 //! attachments and non-UTF-8 text survive unchanged.
 //!
+//! Large files (above the sender's inline limit, default 1 MiB) are not
+//! carried inline: the event has no `content` and a `blob` object instead
+//! (`size`, `chunk_size`, `chunks`), and receivers pull the bytes in chunks
+//! from `vault/blob/<sha256>/<index>` (see [`crate::blob`]). Builds that
+//! predate `blob` see a live event without content and drop it as
+//! `MissingContent` (no file is written).
+//!
 //! Version clock: a per-note Lamport counter. A device that edits a note it
 //! last saw at version `n` publishes `n + 1`. Two devices that edit the same
 //! base concurrently both publish `n + 1`; [`Stamp::rank`] breaks the tie
@@ -147,6 +154,33 @@ impl Stamp {
     }
 }
 
+/// Size of a file that travels in chunks instead of inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobInfo {
+    /// File size in bytes.
+    pub size: u64,
+    /// Chunk size the sender suggests (any server answers any size).
+    pub chunk_size: u64,
+    /// `ceil(size / chunk_size)`.
+    pub chunks: u64,
+}
+
+impl BlobInfo {
+    pub fn new(size: u64, chunk_size: u64) -> Self {
+        BlobInfo {
+            size,
+            chunk_size,
+            chunks: crate::blob::chunk_count(size, chunk_size),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.chunk_size >= crate::blob::MIN_CHUNK_SIZE
+            && self.chunk_size <= crate::blob::MAX_CHUNK_SIZE
+            && self.chunks == crate::blob::chunk_count(self.size, self.chunk_size)
+    }
+}
+
 /// One change, as published on `vault/notes/<path>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteEvent {
@@ -159,6 +193,9 @@ pub struct NoteEvent {
     /// Set on conflict-copy events only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict: Option<ConflictInfo>,
+    /// Set instead of `content` when the bytes travel in chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<BlobInfo>,
 }
 
 #[derive(Debug)]
@@ -166,10 +203,15 @@ pub enum DecodeError {
     Json(serde_json::Error),
     UnsupportedFormat(u32),
     BadPath(key::PathError),
-    KeyMismatch { key: String, path: String },
+    KeyMismatch {
+        key: String,
+        path: String,
+    },
     HashMismatch,
     MissingContent,
     TombstoneWithContent,
+    /// `blob` together with `content`, on a tombstone, or inconsistent.
+    BadBlob,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -189,6 +231,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::HashMismatch => f.write_str("sha256 does not match content"),
             DecodeError::MissingContent => f.write_str("live event without content"),
             DecodeError::TombstoneWithContent => f.write_str("tombstone carries content"),
+            DecodeError::BadBlob => f.write_str("bad blob reference"),
         }
     }
 }
@@ -203,6 +246,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// 64 lower-case hex digits.
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn now_ms() -> u64 {
@@ -237,6 +287,7 @@ impl NoteEvent {
             },
             content: Some(content),
             conflict: None,
+            blob: None,
         }
     }
 
@@ -263,6 +314,7 @@ impl NoteEvent {
             },
             content: None,
             conflict: None,
+            blob: None,
         }
     }
 
@@ -273,9 +325,53 @@ impl NoteEvent {
         self
     }
 
-    /// Bytes of the content (0 for a tombstone).
+    /// Bytes of the content (0 for a tombstone). Blob references report
+    /// the referenced size.
     pub fn size(&self) -> u64 {
-        self.content.as_ref().map_or(0, |c| c.len() as u64)
+        match (&self.content, &self.blob) {
+            (Some(c), _) => c.len() as u64,
+            (None, Some(b)) => b.size,
+            _ => 0,
+        }
+    }
+
+    /// A reference whose bytes still have to be fetched.
+    pub fn is_blob_ref(&self) -> bool {
+        self.blob.is_some() && self.content.is_none()
+    }
+
+    /// The same state as a blob reference (content dropped), if the content
+    /// is larger than `inline_max`. `None` = small enough to stay inline.
+    pub fn to_blob_ref(&self, inline_max: u64, chunk_size: u64) -> Option<NoteEvent> {
+        let c = self.content.as_ref()?;
+        if (c.len() as u64) <= inline_max {
+            return None;
+        }
+        Some(NoteEvent {
+            format: self.format,
+            stamp: self.stamp.clone(),
+            content: None,
+            conflict: self.conflict.clone(),
+            blob: Some(BlobInfo::new(c.len() as u64, chunk_size)),
+        })
+    }
+
+    /// Fill a blob reference with fetched bytes. Fails unless size and
+    /// SHA-256 match the reference.
+    pub fn with_content(&self, bytes: Vec<u8>) -> Result<NoteEvent, DecodeError> {
+        let Some(b) = &self.blob else {
+            return Err(DecodeError::BadBlob);
+        };
+        if bytes.len() as u64 != b.size || sha256_hex(&bytes) != self.stamp.sha256 {
+            return Err(DecodeError::HashMismatch);
+        }
+        Ok(NoteEvent {
+            format: self.format,
+            stamp: self.stamp.clone(),
+            content: Some(bytes),
+            conflict: self.conflict.clone(),
+            blob: None,
+        })
     }
 
     pub fn key(&self) -> Result<String, key::PathError> {
@@ -309,6 +405,16 @@ impl NoteEvent {
                     path: ev.stamp.path.clone(),
                 });
             }
+        }
+        if let Some(b) = &ev.blob {
+            if ev.content.is_some()
+                || ev.stamp.deleted
+                || !b.is_valid()
+                || !is_sha256_hex(&ev.stamp.sha256)
+            {
+                return Err(DecodeError::BadBlob);
+            }
+            return Ok(ev);
         }
         match (&ev.content, ev.stamp.deleted) {
             (Some(_), true) => return Err(DecodeError::TombstoneWithContent),
@@ -512,5 +618,79 @@ mod tests {
         assert!(a.beats(&t) && b.beats(&t), "live beats tombstone on a tie");
         assert!(a.beats(&b) != b.beats(&a));
         assert!(!a.beats(&a) && a.same_state(&a.clone()));
+    }
+
+    #[test]
+    fn blob_reference_roundtrip_and_validation() {
+        let big: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        let e = NoteEvent::put("Daily/p.jpg", big.clone(), "nitro5", 2, None, 9)
+            .by("nitro5/external", cause::EXTERNAL_EDIT);
+        assert!(
+            e.to_blob_ref(3000, 4096).is_none(),
+            "at the limit stays inline"
+        );
+        let r = e.to_blob_ref(1000, 4096).unwrap();
+        assert!(r.is_blob_ref());
+        assert_eq!(r.size(), 3000);
+        let v: serde_json::Value = serde_json::from_slice(&r.encode()).unwrap();
+        assert!(v.get("content").is_none());
+        assert_eq!(v["blob"]["size"], 3000);
+        assert_eq!(v["blob"]["chunk_size"], 4096);
+        assert_eq!(v["blob"]["chunks"], 1);
+        let wire = String::from_utf8(r.encode()).unwrap();
+        assert!(
+            wire.ends_with(
+                r#""cause":"external-edit","blob":{"size":3000,"chunk_size":4096,"chunks":1}}"#
+            ),
+            "{wire}"
+        );
+        let back = NoteEvent::decode(&r.encode(), Some(&r.key().unwrap())).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.with_content(big.clone()).unwrap(), e);
+        assert!(matches!(
+            back.with_content(vec![0; 3000]),
+            Err(DecodeError::HashMismatch)
+        ));
+        assert!(matches!(
+            back.with_content(big[..10].to_vec()),
+            Err(DecodeError::HashMismatch)
+        ));
+
+        // What a build without `blob` sees: a live event without content,
+        // rejected as MissingContent (dropped, nothing written).
+        let mut old: serde_json::Value = serde_json::from_slice(&r.encode()).unwrap();
+        old.as_object_mut().unwrap().remove("blob");
+        assert!(matches!(
+            NoteEvent::decode(old.to_string().as_bytes(), None),
+            Err(DecodeError::MissingContent)
+        ));
+        // Inconsistent references are rejected.
+        for (field, val) in [
+            ("content", serde_json::json!("aGk=")),
+            ("deleted", serde_json::json!(true)),
+            ("sha256", serde_json::json!("abc")),
+        ] {
+            let mut v: serde_json::Value = serde_json::from_slice(&r.encode()).unwrap();
+            v[field] = val;
+            assert!(
+                matches!(
+                    NoteEvent::decode(v.to_string().as_bytes(), None),
+                    Err(DecodeError::BadBlob)
+                ),
+                "{field}"
+            );
+        }
+        let mut v: serde_json::Value = serde_json::from_slice(&r.encode()).unwrap();
+        v["blob"]["chunks"] = 5.into();
+        assert!(matches!(
+            NoteEvent::decode(v.to_string().as_bytes(), None),
+            Err(DecodeError::BadBlob)
+        ));
+        v["blob"]["chunks"] = 1.into();
+        v["blob"]["chunk_size"] = 1.into();
+        assert!(matches!(
+            NoteEvent::decode(v.to_string().as_bytes(), None),
+            Err(DecodeError::BadBlob)
+        ));
     }
 }
