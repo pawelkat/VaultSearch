@@ -4,3 +4,5 @@
 .idea/
 .vscode/
 bindings/
+# test artifacts: vault-searchd tests write a sync log under ./.local when HOME is unset
+**/.local/

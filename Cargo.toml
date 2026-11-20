@@ -6,6 +6,7 @@ members = [
     "crates/vault-searchd",
     "crates/vault-search-mcp",
     "crates/vault-rclone",
+    "crates/vault-events",
 ]
 
 [workspace.package]

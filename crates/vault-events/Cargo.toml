@@ -1,0 +1,32 @@
+[package]
+name = "vault-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Event-based vault sync over Zenoh: note events, hub storage, and a file-watching agent"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vault-events"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+vault-rclone = { path = "../vault-rclone" }
+zenoh = { version = "1.10.2", default-features = false, features = ["transport_tcp"] }
+
+[dev-dependencies]
+tempfile = "3"

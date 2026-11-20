@@ -245,6 +245,92 @@ pub fn resync(
     run_bisync(cfg, host, runner, reindexer, true, dry_run, out)
 }
 
+/// `vault-rclone backup`: one-way `rclone copy --update` local -> Drive.
+///
+/// For the event-sync hub: Drive becomes a backup that is only written
+/// from the hub's tree. Nothing on Drive is deleted and newer Drive files
+/// are never overwritten. Guards: `VAULT_LOCAL` is a directory holding at
+/// least `MIN_FILES` files. No reindex afterwards (the local tree did not
+/// change).
+pub fn backup(
+    cfg: &Config,
+    host: &Host,
+    runner: &dyn CommandRunner,
+    dry_run: bool,
+    out: &mut dyn Write,
+) -> io::Result<i32> {
+    let name = "backup";
+    let mut log = RunLog::new(cfg, name);
+    let fail = |log: &mut RunLog, out: &mut dyn Write, msg: String| -> io::Result<i32> {
+        writeln!(out, "{name}: {msg}")?;
+        log.line(&format!("refused: {msg}"), out)?;
+        log.line(&format!("end exit={EXIT_FAIL}"), out)?;
+        Ok(EXIT_FAIL)
+    };
+    let local: &Path = match cfg.require_local() {
+        Ok(p) => p,
+        Err(e) => return fail(&mut log, out, e.to_string()),
+    };
+    log.line(
+        &format!(
+            "start local={} -> remote={} (copy --update){}",
+            local.display(),
+            cfg.vault_remote,
+            if dry_run { " dry-run" } else { "" }
+        ),
+        out,
+    )?;
+    if !local.is_dir() {
+        return fail(
+            &mut log,
+            out,
+            format!("{} is missing or not a directory", local.display()),
+        );
+    }
+    let min = u64::from(cfg.min_files);
+    match count_local_files(local) {
+        Ok(n) if n >= min => {}
+        Ok(n) => {
+            return fail(
+                &mut log,
+                out,
+                format!(
+                    "local {} has {n} files, below MIN_FILES={min}; refusing",
+                    local.display()
+                ),
+            )
+        }
+        Err(e) => return fail(&mut log, out, format!("cannot count local files: {e}")),
+    }
+    let bin = match host.locate(cfg) {
+        Ok(b) => b,
+        Err(e) => return fail(&mut log, out, e.to_string()),
+    };
+    let filters = match resolve_filters(cfg, host) {
+        Ok(f) => f,
+        Err(e) => return fail(&mut log, out, e.to_string()),
+    };
+    let args = rclone::backup_args(cfg, local, filters.as_deref(), dry_run);
+    let code = match runner.run(&bin, &args) {
+        Ok(o) => {
+            let code = exit_code(&o);
+            if code != EXIT_OK {
+                let err = error_line(&o.stderr);
+                writeln!(out, "{name}: FAILED (rclone exit {code}): {err}")?;
+                log.line(&format!("rclone error: {err}"), out)?;
+            }
+            code
+        }
+        Err(e) => {
+            writeln!(out, "{name}: FAILED ({e})")?;
+            log.line(&format!("spawn error: {e}"), out)?;
+            EXIT_FAIL
+        }
+    };
+    log.line(&format!("end exit={code}"), out)?;
+    Ok(code)
+}
+
 fn run_bisync(
     cfg: &Config,
     host: &Host,
@@ -354,6 +440,11 @@ fn run_bisync(
         );
     }
 
+    // Tell other programs (the vault-events agent) that file changes in
+    // VAULT_LOCAL from now until shortly after the run come from Drive.
+    // Skipped on --dry-run: nothing is written then.
+    let _marker =
+        (!dry_run).then(|| crate::marker::SyncMarker::start(&crate::marker::marker_dir(cfg), name));
     let opts = BisyncOpts {
         resync,
         dry_run,
@@ -498,6 +589,11 @@ mod tests {
                     stdout: String::new(),
                     stderr: self.bisync_stderr.clone(),
                 },
+                "copy" => RunOutput {
+                    code: Some(self.bisync_code),
+                    stdout: String::new(),
+                    stderr: self.bisync_stderr.clone(),
+                },
                 "lsf" if self.lsf_ok => ok("Daily/\nInbox.md\n".into()),
                 "lsf" => RunOutput {
                     code: Some(3),
@@ -552,6 +648,63 @@ mod tests {
         }
     }
 
+    /// Records whether `sync.running` existed when bisync was spawned.
+    struct MarkerProbe {
+        inner: Fake,
+        dir: PathBuf,
+        seen: RefCell<Option<bool>>,
+    }
+    impl CommandRunner for MarkerProbe {
+        fn run(&self, p: &Path, args: &[String]) -> Result<RunOutput, Error> {
+            if args[0] == "bisync" {
+                *self.seen.borrow_mut() = Some(self.dir.join(crate::marker::RUNNING_FILE).exists());
+            }
+            self.inner.run(p, args)
+        }
+    }
+
+    #[test]
+    fn bisync_runs_under_marker_and_leaves_last() {
+        let (_d, host, cfg) = setup(3);
+        let dir = crate::marker::marker_dir(&cfg);
+        let probe = MarkerProbe {
+            inner: Fake::new(),
+            dir: dir.clone(),
+            seen: RefCell::new(None),
+        };
+        let (code, s) = run(|o| sync(&cfg, &host, &probe, &NoDaemon, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        assert_eq!(
+            *probe.seen.borrow(),
+            Some(true),
+            "marker present during bisync"
+        );
+        assert!(!dir.join(crate::marker::RUNNING_FILE).exists());
+        assert!(dir.join(crate::marker::LAST_FILE).exists());
+        // A failing bisync also clears the marker.
+        let mut fail = Fake::new();
+        fail.bisync_code = 2;
+        let probe = MarkerProbe {
+            inner: fail,
+            dir: dir.clone(),
+            seen: RefCell::new(None),
+        };
+        let (code, _) = run(|o| sync(&cfg, &host, &probe, &NoDaemon, false, o));
+        assert_eq!(code, 2);
+        assert_eq!(*probe.seen.borrow(), Some(true));
+        assert!(!dir.join(crate::marker::RUNNING_FILE).exists());
+        // Dry runs write nothing, so no marker.
+        std::fs::remove_file(dir.join(crate::marker::LAST_FILE)).unwrap();
+        let probe = MarkerProbe {
+            inner: Fake::new(),
+            dir: dir.clone(),
+            seen: RefCell::new(None),
+        };
+        let _ = run(|o| sync(&cfg, &host, &probe, &NoDaemon, true, o));
+        assert_eq!(*probe.seen.borrow(), Some(false));
+        assert!(!dir.join(crate::marker::LAST_FILE).exists());
+    }
+
     #[test]
     fn sync_happy_path_runs_bisync_without_resync() {
         let (_d, host, cfg) = setup(3);
@@ -587,6 +740,55 @@ mod tests {
         let calls = fake.calls.borrow();
         assert_eq!(calls[0][0], "size");
         assert_eq!(calls[1][0], "bisync");
+    }
+
+    #[test]
+    fn backup_is_one_way_copy_update_without_deletes() {
+        let (_d, host, cfg) = setup(3);
+        let fake = Fake::new();
+        let (code, s) = run(|o| backup(&cfg, &host, &fake, false, o));
+        assert_eq!(code, EXIT_OK, "{s}");
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 1, "no size/bisync call: {calls:?}");
+        let argv = &calls[0];
+        assert_eq!(argv[0], "copy");
+        assert_eq!(
+            argv[1],
+            cfg.vault_local.as_ref().unwrap().display().to_string()
+        );
+        assert_eq!(argv[2], "gdrive:Vault");
+        assert!(argv.contains(&"--update".to_string()));
+        assert!(!argv.contains(&"--dry-run".to_string()));
+        for bad in [
+            "sync",
+            "bisync",
+            "--delete-after",
+            "--delete-during",
+            "--resync",
+        ] {
+            assert!(!argv.contains(&bad.to_string()), "{bad} in {argv:?}");
+        }
+        let log = read_log(&cfg);
+        assert!(log.contains("backup start local="), "{log}");
+        assert!(log.contains("end exit=0"), "{log}");
+        drop(calls);
+        let (_, _) = run(|o| backup(&cfg, &host, &fake, true, o));
+        assert!(fake.calls.borrow()[1].contains(&"--dry-run".to_string()));
+    }
+
+    #[test]
+    fn backup_refuses_nearly_empty_local_and_passes_exit_code() {
+        let (_d, host, cfg) = setup(2);
+        let fake = Fake::new();
+        let (code, s) = run(|o| backup(&cfg, &host, &fake, false, o));
+        assert_eq!(code, EXIT_FAIL);
+        assert!(s.contains("below MIN_FILES=3"), "{s}");
+        assert!(fake.calls.borrow().is_empty());
+        let (_d, host, cfg) = setup(3);
+        let mut fake = Fake::new();
+        fake.bisync_code = 5;
+        let (code, _) = run(|o| backup(&cfg, &host, &fake, false, o));
+        assert_eq!(code, 5);
     }
 
     #[test]

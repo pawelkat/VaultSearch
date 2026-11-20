@@ -104,6 +104,7 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 | `vault-searchd` | Daemon (index, search, optional vault sync) and `query` / `reindex` / `status` clients. |
 | `vault-search-mcp` | Line-delimited JSON-RPC, protocol `2024-11-05`. |
 | `vault-rclone` | Vault-only wrapper around the `rclone` binary. |
+| `vault-events` | Event sync over Zenoh: hub (router + storage), file-watching agent. Stage 1. |
 
 ## Vault sync (rclone)
 
@@ -113,6 +114,10 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 cargo run -p vault-rclone -- status
 cargo run -p vault-rclone -- sync --dry-run
 ```
+
+## Event sync (Zenoh, stage 1)
+
+`crates/vault-events` moves vault changes as events over Zenoh instead of two-way bisync: `vault-events hub` (embedded Zenoh router on TCP 7447 plus latest-state storage under `~/.local/share/vault-events/hub`, answering catch-up queries) and `vault-events agent --vault DIR` (a `notify` watcher that publishes saves, applies incoming events without echo, catches up after being offline, and keeps losers of concurrent edits as `<name> (conflict <device> <date>).md`). Drive becomes a one-way backup via `vault-rclone backup` (`rclone copy --update`, never deletes); bisync stays the fallback. `vault-searchd` needs no change: its vault watch reindexes the files the agent writes. Supervised by `contrib/vault-search-watchdog` when `VAULT_EVENTS_ENABLE=1` (default off). Zenoh 1.10.2, EPL-2.0 OR Apache-2.0. Details: [crates/vault-events/README.md](crates/vault-events/README.md).
 
 ## Integrated desktop
 
