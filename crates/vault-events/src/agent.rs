@@ -23,12 +23,12 @@ use crate::ack::{self, TransferAck};
 use crate::blob::{self, OutgoingCache, TransferOpts, ZenohSource};
 use crate::claims;
 use crate::conflict::{self, Decision};
-use crate::event::{cause, now_ms, ConflictInfo, NoteEvent, Stamp};
+use crate::event::{cause, now_ms, BlobInfo, ConflictInfo, NoteEvent, Stamp};
 use crate::key;
 use crate::net;
 use crate::presence;
 use crate::state::AgentState;
-use crate::vault::{is_synced_path, may_contain_synced, Disk, VaultFs};
+use crate::vault::{is_synced_path, may_contain_synced, Disk, Inspect, VaultFs};
 
 pub const DEFAULT_MAX_DELETE: usize = 50;
 /// Program label of the agent's own writes (`<device>/agent`).
@@ -40,6 +40,33 @@ pub const BISYNC_WINDOW_MS: u64 = 5_000;
 /// Reports whether a Drive bisync is writing the vault right now.
 pub type BisyncProbe = Box<dyn Fn() -> bool + Send + Sync>;
 pub const DEFAULT_MIN_FILES: usize = 3;
+/// Wait this long for the hub liveliness token before the first catch-up.
+pub const DEFAULT_HUB_WAIT: Duration = Duration::from_secs(30);
+/// After the hub token reappears, wait this long before catching up.
+pub const DEFAULT_CATCHUP_DEBOUNCE: Duration = Duration::from_secs(3);
+/// Retries for one catch-up fetch (note or blob) before counting it failed.
+pub const ITEM_RETRIES: u32 = 3;
+
+/// Short retry after a missed catch-up: 2, 5, 10, 30 s, then `normal`.
+pub fn catchup_backoff(failures: u32, normal: Duration) -> Duration {
+    const STEPS: &[u64] = &[2, 5, 10, 30];
+    if failures == 0 {
+        return normal;
+    }
+    STEPS
+        .get((failures as usize).saturating_sub(1))
+        .copied()
+        .map(Duration::from_secs)
+        .unwrap_or(normal)
+}
+
+/// One-line catch-up result.
+pub fn catchup_summary(listed: usize, fetched: usize, failed: usize, elapsed: Duration) -> String {
+    format!(
+        "catch-up: {listed} listed, {fetched} fetched, {failed} failed in {:.1}s",
+        elapsed.as_secs_f64()
+    )
+}
 
 /// What one incoming event did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -76,6 +103,9 @@ pub struct AgentCore {
     pub claims_dir: Option<PathBuf>,
     /// First scan of a fresh agent state: untracked files are `seed`.
     pub seeding: bool,
+    /// Files larger than this are published as blob references (no content).
+    pub inline_max: u64,
+    pub chunk_size: u64,
     dirty: bool,
 }
 
@@ -92,6 +122,8 @@ impl AgentCore {
             bisync_active: Box::new(|| false),
             claims_dir: None,
             seeding: false,
+            inline_max: blob::DEFAULT_INLINE_MAX,
+            chunk_size: blob::DEFAULT_CHUNK_SIZE,
             dirty: false,
         }
     }
@@ -143,30 +175,55 @@ impl AgentCore {
 
     /// Apply one event that arrived from the network.
     pub fn on_incoming(&mut self, ev: &NoteEvent) -> io::Result<Applied> {
+        self.apply_incoming(ev, None, &[])
+    }
+
+    /// Apply a fetched blob whose verified bytes are the file `src`.
+    pub fn on_incoming_from(&mut self, ev: &NoteEvent, src: &Path) -> io::Result<Applied> {
+        self.apply_incoming(ev, Some(src), &[])
+    }
+
+    pub fn on_incoming_with(
+        &mut self,
+        ev: &NoteEvent,
+        src: Option<&Path>,
+        ancestors: &[String],
+    ) -> io::Result<Applied> {
+        self.apply_incoming(ev, src, ancestors)
+    }
+
+    fn apply_incoming(
+        &mut self,
+        ev: &NoteEvent,
+        src: Option<&Path>,
+        ancestors: &[String],
+    ) -> io::Result<Applied> {
         let path = ev.stamp.path.clone();
         let mut out = Applied::default();
         if !is_synced_path(&path) {
             tracing::debug!("ignoring event for ignored path {path}");
             return Ok(out);
         }
-        let disk = self.fs.read(&path)?;
-        if let Disk::Skipped(why) = &disk {
+        let look = self.fs.inspect(&path)?;
+        if let Inspect::Skipped(why) = &look {
             tracing::warn!("not applying event for {path}: local file is {why}");
             return Ok(out);
         }
-        let local_ts = match &disk {
-            Disk::Present { mtime_ms, .. } => *mtime_ms,
+        let local_ts = match &look {
+            Inspect::Present { mtime_ms, .. } => *mtime_ms,
             _ => now_ms(),
         };
-        let d = conflict::decide(
+        let ancestor_refs: Vec<&str> = ancestors.iter().map(|s| s.as_str()).collect();
+        let d = conflict::decide_with(
             self.state.stamp(&path),
-            disk.sha(),
+            look.sha(),
             &ev.stamp,
             &self.device,
             local_ts,
+            &ancestor_refs,
         );
         out.decision = Some(d.clone());
-        if ev.is_blob_ref() && decision_needs_bytes(&d) {
+        if ev.is_blob_ref() && decision_needs_bytes(&d) && src.is_none() && ev.content.is_none() {
             // Never apply (or save as a conflict copy) a file whose bytes
             // have not been fetched and verified.
             return Err(io::Error::other(format!(
@@ -179,21 +236,28 @@ impl AgentCore {
             Decision::Ignore => {}
             Decision::Adopt => self.record(ev.stamp.clone()),
             Decision::Apply { save_local_as } => {
-                if let (Some(name), Disk::Present { bytes, sha256, .. }) = (&save_local_as, &disk) {
+                if let (Some(name), Inspect::Present { sha256, size, .. }) = (&save_local_as, &look)
+                {
                     let info = ConflictInfo {
                         of: path.clone(),
                         winner_sha256: inc.sha256.clone(),
                         winner_size: ev.size(),
                         winner_origin: inc.origin.clone(),
                         loser_sha256: sha256.clone(),
-                        loser_size: bytes.len() as u64,
+                        loser_size: *size,
                         loser_origin: self.device.clone(),
                     };
-                    self.write_conflict(name, bytes, info, &mut out)?;
+                    let local = self.fs.abs(&path)?;
+                    self.write_conflict_from(name, &local, info, &mut out)?;
                 }
-                match &ev.content {
-                    Some(c) if !ev.stamp.deleted => self.fs.write_atomic(&path, c)?,
-                    _ => self.fs.remove(&path)?,
+                if ev.stamp.deleted {
+                    self.fs.remove(&path)?;
+                } else if let Some(p) = src {
+                    self.fs.write_atomic_from(&path, p)?;
+                } else if let Some(c) = &ev.content {
+                    self.fs.write_atomic(&path, c)?;
+                } else {
+                    return Err(io::Error::other(format!("{path}: no content to apply")));
                 }
                 out.changed = true;
                 self.record(ev.stamp.clone());
@@ -203,37 +267,69 @@ impl AgentCore {
                 save_incoming_as,
             } => {
                 let (writer, why) =
-                    self.classify(&path, disk.sha(), self.state.stamp(&path).is_some());
+                    self.classify(&path, look.sha(), self.state.stamp(&path).is_some());
                 local.writer = Some(writer);
                 local.cause = Some(why.to_string());
-                let content = match disk {
-                    Disk::Present { bytes, .. } => Some(bytes),
-                    _ => None,
+                let local_size = match &look {
+                    Inspect::Present { size, .. } => *size,
+                    _ => 0,
                 };
-                if let (Some(name), Some(c)) = (&save_incoming_as, &ev.content) {
+                if let Some(name) = &save_incoming_as {
                     let info = ConflictInfo {
                         of: path.clone(),
                         winner_sha256: local.sha256.clone(),
-                        winner_size: content.as_ref().map_or(0, |b| b.len() as u64),
+                        winner_size: local_size,
                         winner_origin: self.device.clone(),
                         loser_sha256: inc.sha256.clone(),
-                        loser_size: c.len() as u64,
+                        loser_size: ev.size(),
                         loser_origin: inc.origin.clone(),
                     };
-                    self.write_conflict(name, c, info, &mut out)?;
+                    if let Some(p) = src {
+                        self.write_conflict_from(name, p, info, &mut out)?;
+                    } else if let Some(c) = &ev.content {
+                        self.write_conflict(name, c, info, &mut out)?;
+                    }
                 }
-                let ev = NoteEvent {
-                    format: crate::event::FORMAT_VERSION,
-                    stamp: local.clone(),
-                    content,
-                    conflict: None,
-                    blob: None,
-                };
+                let ev = self.local_winner_event(local.clone(), &look)?;
                 self.record(local);
-                out.publish.push(ev);
+                if let Some(ev) = ev {
+                    out.publish.push(ev);
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Event that republishes the local winner of a conflict.
+    fn local_winner_event(&self, local: Stamp, look: &Inspect) -> io::Result<Option<NoteEvent>> {
+        match look {
+            Inspect::Present { size, .. } if *size > self.inline_max => Ok(Some(NoteEvent {
+                format: crate::event::FORMAT_VERSION,
+                stamp: local,
+                content: None,
+                conflict: None,
+                blob: Some(BlobInfo::new(*size, self.chunk_size)),
+            })),
+            Inspect::Present { .. } => {
+                let Disk::Present { bytes, .. } = self.fs.read(&local.path)? else {
+                    return Ok(None);
+                };
+                Ok(Some(NoteEvent {
+                    format: crate::event::FORMAT_VERSION,
+                    stamp: local,
+                    content: Some(bytes),
+                    conflict: None,
+                    blob: None,
+                }))
+            }
+            _ => Ok(Some(NoteEvent {
+                format: crate::event::FORMAT_VERSION,
+                stamp: local,
+                content: None,
+                conflict: None,
+                blob: None,
+            })),
+        }
     }
 
     /// Whether applying blob reference `ev` needs its bytes (it would be
@@ -243,17 +339,17 @@ impl AgentCore {
         if !is_synced_path(&ev.stamp.path) {
             return false;
         }
-        let disk = match self.fs.read(&ev.stamp.path) {
-            Ok(Disk::Skipped(_)) | Err(_) => return false,
+        let look = match self.fs.inspect(&ev.stamp.path) {
+            Ok(Inspect::Skipped(_)) | Err(_) => return false,
             Ok(d) => d,
         };
-        let local_ts = match &disk {
-            Disk::Present { mtime_ms, .. } => *mtime_ms,
+        let local_ts = match &look {
+            Inspect::Present { mtime_ms, .. } => *mtime_ms,
             _ => now_ms(),
         };
         let d = conflict::decide(
             self.state.stamp(&ev.stamp.path),
-            disk.sha(),
+            look.sha(),
             &ev.stamp,
             &self.device,
             local_ts,
@@ -283,6 +379,54 @@ impl AgentCore {
             return Ok(());
         };
         self.fs.write_atomic(&slot, bytes)?;
+        tracing::warn!(
+            "conflict on {}: kept {} B {} from {}, saved {} B {} from {} as {slot} by {}",
+            info.of,
+            info.winner_size,
+            short(&info.winner_sha256),
+            info.winner_origin,
+            info.loser_size,
+            short(&info.loser_sha256),
+            info.loser_origin,
+            self.own_writer()
+        );
+        if info.kept_smaller() {
+            tracing::warn!(
+                "conflict on {}: the live path keeps the SMALLER side ({} B < {} B); check {slot}",
+                info.of,
+                info.winner_size,
+                info.loser_size
+            );
+        }
+        out.conflicts.push(slot.clone());
+        let label = (self.own_writer(), cause::CONFLICT_COPY);
+        if let Some(mut ev) = self.local_change_as(&slot, false, Some(label))? {
+            ev.conflict = Some(info);
+            out.publish.push(ev);
+        }
+        Ok(())
+    }
+
+    /// Conflict copy from a file already on disk (no whole-file buffer).
+    fn write_conflict_from(
+        &mut self,
+        name: &str,
+        src: &Path,
+        info: ConflictInfo,
+        out: &mut Applied,
+    ) -> io::Result<()> {
+        if info.loser_sha256 == info.winner_sha256 {
+            tracing::info!("conflict on {}: both sides identical, no copy", info.of);
+            return Ok(());
+        }
+        let Some(slot) = self.fs.conflict_slot_sha(name, &info.loser_sha256)? else {
+            tracing::info!(
+                "conflict on {}: copy {name} already holds these bytes",
+                info.of
+            );
+            return Ok(());
+        };
+        self.fs.write_atomic_from(&slot, src)?;
         tracing::warn!(
             "conflict on {}: kept {} B {} from {}, saved {} B {} from {} as {slot} by {}",
             info.of,
@@ -347,16 +491,15 @@ impl AgentCore {
         let prev = entry.as_ref().map(|e| &e.stamp);
         let prev_sha = prev.and_then(|s| (!s.deleted).then(|| s.sha256.clone()));
         let version = prev.map_or(1, |s| s.version + 1);
-        match self.fs.read(rel)? {
-            Disk::Skipped(why) => {
+        match self.fs.inspect(rel)? {
+            Inspect::Skipped(why) => {
                 tracing::debug!("not syncing {rel}: {why}");
                 Ok(None)
             }
-            Disk::Present {
+            Inspect::Present {
                 sha256,
-                bytes,
+                size,
                 mtime_ms,
-                ..
             } => {
                 if prev_sha.as_deref() == Some(sha256.as_str()) {
                     // Content unchanged (touch, or our own write): refresh cache.
@@ -375,12 +518,31 @@ impl AgentCore {
                 // like rclone's "newer wins" instead of "whoever published
                 // last". Only a tie-break after the version counter.
                 let ts = if mtime_ms > 0 { mtime_ms } else { now_ms() };
-                let ev = NoteEvent::put(rel, bytes, &self.device, version, prev_sha, ts)
-                    .by(&writer, why);
+                let ev = if size > self.inline_max {
+                    NoteEvent::blob_put(
+                        rel,
+                        sha256,
+                        size,
+                        self.chunk_size,
+                        &self.device,
+                        version,
+                        prev_sha,
+                        ts,
+                    )
+                    .by(&writer, why)
+                } else {
+                    match self.fs.read(rel)? {
+                        Disk::Present { bytes, .. } => {
+                            NoteEvent::put(rel, bytes, &self.device, version, prev_sha, ts)
+                                .by(&writer, why)
+                        }
+                        _ => return Ok(None),
+                    }
+                };
                 self.record(ev.stamp.clone());
                 Ok(Some(ev))
             }
-            Disk::Absent => match prev {
+            Inspect::Absent => match prev {
                 Some(s) if !s.deleted => {
                     let (writer, why) = match label {
                         Some(l) => l,
@@ -417,7 +579,7 @@ impl AgentCore {
             .iter()
             .filter(|p| {
                 self.state.stamp(p).is_some_and(|s| !s.deleted)
-                    && matches!(self.fs.read(p), Ok(Disk::Absent))
+                    && matches!(self.fs.inspect(p), Ok(Inspect::Absent))
             })
             .cloned()
             .collect();
@@ -543,8 +705,8 @@ impl AgentCore {
                 (Some(rm), Some(rs)) => (rm, rs) != (m, sz),
                 // No recorded stat: compare the hash.
                 _ => !matches!(
-                    self.fs.read(rel),
-                    Ok(Disk::Present { ref sha256, .. }) if *sha256 == e.stamp.sha256
+                    self.fs.inspect(rel),
+                    Ok(Inspect::Present { ref sha256, .. }) if *sha256 == e.stamp.sha256
                 ),
             },
         }
@@ -570,29 +732,42 @@ impl AgentCore {
         }
         st.cause = Some(cause::CATCHUP_REPUBLISH.to_string());
         let foreign = st.origin != self.device;
-        match (self.fs.read(rel)?, st.deleted) {
+        match (self.fs.inspect(rel)?, st.deleted) {
             // Unchanged here and made elsewhere: not ours to resend.
-            (Disk::Absent, true) if foreign => Ok(None),
-            (Disk::Present { ref sha256, .. }, false) if foreign && *sha256 == st.sha256 => {
+            (Inspect::Absent, true) if foreign => Ok(None),
+            (Inspect::Present { ref sha256, .. }, false) if foreign && *sha256 == st.sha256 => {
                 Ok(None)
             }
-            (Disk::Absent, true) => Ok(Some(NoteEvent {
+            (Inspect::Absent, true) => Ok(Some(NoteEvent {
                 format: crate::event::FORMAT_VERSION,
                 stamp: st,
                 content: None,
                 conflict: None,
                 blob: None,
             })),
-            (Disk::Present { sha256, bytes, .. }, false) if sha256 == st.sha256 => {
-                Ok(Some(NoteEvent {
-                    format: crate::event::FORMAT_VERSION,
-                    stamp: st,
-                    content: Some(bytes),
-                    conflict: None,
-                    blob: None,
-                }))
+            (Inspect::Present { sha256, size, .. }, false) if sha256 == st.sha256 => {
+                if size > self.inline_max {
+                    Ok(Some(NoteEvent {
+                        format: crate::event::FORMAT_VERSION,
+                        stamp: st,
+                        content: None,
+                        conflict: None,
+                        blob: Some(BlobInfo::new(size, self.chunk_size)),
+                    }))
+                } else {
+                    let Disk::Present { bytes, .. } = self.fs.read(rel)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some(NoteEvent {
+                        format: crate::event::FORMAT_VERSION,
+                        stamp: st,
+                        content: Some(bytes),
+                        conflict: None,
+                        blob: None,
+                    }))
+                }
             }
-            (Disk::Skipped(_), _) => Ok(None),
+            (Inspect::Skipped(_), _) => Ok(None),
             _ => self.on_local(rel),
         }
     }
@@ -638,6 +813,10 @@ pub struct AgentOpts {
     pub bisync_marker_dir: Option<PathBuf>,
     /// Inline limit and chunking for large files.
     pub transfer: TransferOpts,
+    /// Wait for the hub liveliness token before the first catch-up.
+    pub hub_wait: Duration,
+    /// After the hub token reappears, wait this long before catching up.
+    pub catchup_debounce: Duration,
 }
 
 /// The agent's network side: session, outgoing blob cache, chunk settings.
@@ -649,6 +828,8 @@ pub struct Link {
     pub partial_dir: PathBuf,
     /// This device (`from=` on every query).
     pub device: String,
+    /// Vault root, so blob chunks are served from the file on disk.
+    pub vault: PathBuf,
 }
 
 impl Link {
@@ -660,7 +841,19 @@ impl Link {
     /// Fetch and verify the bytes of blob reference `ev`; returns the full
     /// event.
     pub async fn fetch_blob(&self, ev: &NoteEvent) -> Result<NoteEvent, net::BoxError> {
-        fetch_blob_with(
+        let f = self.fetch_blob_file(ev).await?;
+        let bytes = std::fs::read(&f.path)?;
+        let ev = ev.with_content(bytes)?;
+        f.discard();
+        Ok(ev)
+    }
+
+    /// Fetch and verify the blob at `ev` as a file on disk (not loaded).
+    pub async fn fetch_blob_file(
+        &self,
+        ev: &NoteEvent,
+    ) -> Result<blob::FetchedFile, net::BoxError> {
+        fetch_blob_file_with(
             &self.source(&ev.stamp.origin),
             &self.partial_dir,
             &self.transfer,
@@ -710,25 +903,45 @@ async fn wait_for_hub(
     }
 }
 
-async fn fetch_blob_with(
+async fn fetch_blob_file_with(
     src: &ZenohSource,
     partial_dir: &Path,
     transfer: &TransferOpts,
     ev: &NoteEvent,
-) -> Result<NoteEvent, net::BoxError> {
+) -> Result<blob::FetchedFile, net::BoxError> {
     let info = ev.blob.ok_or("not a blob reference")?;
-    let f = blob::fetch(src, partial_dir, &ev.stamp.sha256, &info, transfer).await?;
+    let f = blob::fetch_file(src, partial_dir, &ev.stamp.sha256, &info, transfer).await?;
     tracing::info!(
         "fetched blob {} for {}: {} B, {} chunks in {} ms ({} resumed, {} retried), sha256 ok",
         short(&ev.stamp.sha256),
         ev.stamp.path,
-        f.bytes.len(),
+        f.size,
         f.chunks,
         f.elapsed.as_millis(),
         f.resumed,
         f.retries
     );
-    Ok(ev.with_content(f.bytes)?)
+    Ok(f)
+}
+
+async fn fetch_note_retry(
+    session: &zenoh::Session,
+    path: &str,
+    from: &str,
+    timeout: Duration,
+    tries: u32,
+) -> Result<Option<NoteEvent>, net::BoxError> {
+    let mut last = None;
+    for n in 1..=tries.max(1) {
+        last = net::fetch_note(session, path, from, timeout).await?;
+        if last.is_some() {
+            return Ok(last);
+        }
+        if n < tries {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    }
+    Ok(last)
 }
 
 pub fn state_file(state_dir: &Path) -> PathBuf {
@@ -743,24 +956,40 @@ pub type Shutdown = tokio::sync::watch::Receiver<bool>;
 async fn publish_all(link: &Link, evs: &[NoteEvent]) {
     for ev in evs {
         let t = &link.transfer;
-        let (wire, note) = match ev.to_blob_ref(t.inline_max, t.chunk_size) {
-            Some(r) => {
-                link.cache.insert_named(
-                    &ev.stamp.sha256,
-                    &ev.stamp.path,
-                    ev.content.clone().unwrap_or_default(),
-                );
-                let b = r.blob.expect("blob ref");
-                let note = format!(
-                    " as blob ({} B, {} chunks of {} B, sha256 {})",
-                    b.size,
-                    b.chunks,
-                    b.chunk_size,
-                    short(&ev.stamp.sha256)
-                );
-                (r, note)
+        let abs = link.vault.join(&ev.stamp.path);
+        let (wire, note) = if ev.is_blob_ref() {
+            if abs.is_file() {
+                link.cache
+                    .insert_file(&ev.stamp.sha256, &abs, &ev.stamp.path);
             }
-            None => (ev.clone(), String::new()),
+            let b = ev.blob.expect("blob ref");
+            let note = format!(
+                " as blob ({} B, {} chunks of {} B, sha256 {})",
+                b.size,
+                b.chunks,
+                b.chunk_size,
+                short(&ev.stamp.sha256)
+            );
+            (ev.clone(), note)
+        } else if let Some(r) = ev.to_blob_ref(t.inline_max, t.chunk_size) {
+            if abs.is_file() {
+                link.cache
+                    .insert_file(&ev.stamp.sha256, &abs, &ev.stamp.path);
+            } else if let Some(bytes) = ev.content.clone() {
+                link.cache
+                    .insert_named(&ev.stamp.sha256, &ev.stamp.path, bytes);
+            }
+            let b = r.blob.expect("blob ref");
+            let note = format!(
+                " as blob ({} B, {} chunks of {} B, sha256 {})",
+                b.size,
+                b.chunks,
+                b.chunk_size,
+                short(&ev.stamp.sha256)
+            );
+            (r, note)
+        } else {
+            (ev.clone(), String::new())
         };
         let t0 = std::time::Instant::now();
         match net::publish(&link.session, &wire).await {
@@ -858,44 +1087,146 @@ async fn ack_fail(link: &Link, ev: &NoteEvent, duration_ms: u64, reason: impl st
     publish_ack(&link.session, &link.device, &ev.stamp.sha256, &ack).await;
 }
 
+/// Run one catch-up and return `(failure_count, retry_after)`.
+async fn catch_up_or_schedule(
+    core: &mut AgentCore,
+    link: &Link,
+    timeout: Duration,
+    failures: u32,
+    normal: Duration,
+) -> (u32, Option<Duration>) {
+    let t0 = std::time::Instant::now();
+    match catch_up(core, link, timeout).await {
+        Ok(true) => (0, None),
+        Ok(false) => {
+            let n = failures + 1;
+            let wait = catchup_backoff(n, normal);
+            let why = if t0.elapsed() < Duration::from_millis(500) {
+                "no hub answered the catch-up query (no route)"
+            } else {
+                "no hub answered the catch-up query"
+            };
+            tracing::warn!("{why}; retrying in {}s", wait.as_secs());
+            (n, Some(wait))
+        }
+        Err(e) => {
+            let n = failures + 1;
+            let wait = catchup_backoff(n, normal);
+            tracing::warn!("catch-up failed: {e}; retrying in {}s", wait.as_secs());
+            (n, Some(wait))
+        }
+    }
+}
+
+async fn history_ancestors(
+    session: &zenoh::Session,
+    path: &str,
+    incoming_sha: &str,
+    from: &str,
+    timeout: Duration,
+) -> Vec<String> {
+    let Ok(Some(h)) = net::fetch_history(session, path, 50, from, timeout).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in h.entries {
+        if !e.sha256.is_empty() && e.sha256 != incoming_sha {
+            out.push(e.sha256);
+        }
+        if let Some(p) = e.prev_sha256 {
+            if p != incoming_sha && !p.is_empty() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// One catch-up pass against the hub. Returns `false` if no hub answered.
 pub async fn catch_up(
     core: &mut AgentCore,
     link: &Link,
     timeout: Duration,
 ) -> Result<bool, net::BoxError> {
+    let t0 = std::time::Instant::now();
     let session = &link.session;
     let Some(index) = net::fetch_index(session, &link.device, timeout).await? else {
         return Ok(false);
     };
     let (fetch, republish) = core.plan_catchup(&index.stamps);
-    let (mut applied, mut conflicts) = (0usize, 0usize);
+    let (mut applied, mut conflicts, mut fetched, mut failed) = (0usize, 0usize, 0usize, 0usize);
     for p in &fetch {
-        let t0 = std::time::Instant::now();
-        match net::fetch_note(session, p, &link.device, timeout).await? {
-            Some(mut ev) => {
+        let started = std::time::Instant::now();
+        match fetch_note_retry(session, p, &link.device, timeout, ITEM_RETRIES).await? {
+            Some(ev) => {
                 if ev.is_blob_ref() && core.needs_bytes(&ev) {
-                    match link.fetch_blob(&ev).await {
-                        Ok(full) => ev = full,
-                        Err(e) => {
+                    let mut got = None;
+                    let mut last_err: Option<String> = None;
+                    for n in 1..=ITEM_RETRIES {
+                        match link.fetch_blob_file(&ev).await {
+                            Ok(f) => {
+                                got = Some(f);
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e.to_string());
+                                if n < ITEM_RETRIES {
+                                    tokio::time::sleep(Duration::from_millis(400)).await;
+                                }
+                            }
+                        }
+                    }
+                    match got {
+                        Some(f) => {
+                            let ancestors = history_ancestors(
+                                session,
+                                p,
+                                &ev.stamp.sha256,
+                                &link.device,
+                                timeout,
+                            )
+                            .await;
+                            let a = core.on_incoming_with(&ev, Some(&f.path), &ancestors)?;
+                            f.discard();
+                            if a.changed {
+                                tracing::info!("catch-up: {}", applied_line(&ev));
+                            }
+                            applied += usize::from(a.changed);
+                            conflicts += a.conflicts.len();
+                            fetched += 1;
+                            ack_incoming(link, &ev, &a, started.elapsed().as_millis() as u64).await;
+                            publish_all(link, &a.publish).await;
+                            continue;
+                        }
+                        None => {
+                            let e = last_err.unwrap_or_else(|| "not fetched".into());
                             tracing::warn!(
                                 "catch-up: blob for {p} not fetched: {e}; next pass retries"
                             );
-                            ack_fail(link, &ev, t0.elapsed().as_millis() as u64, e).await;
+                            ack_fail(link, &ev, started.elapsed().as_millis() as u64, e).await;
+                            failed += 1;
                             continue;
                         }
                     }
                 }
-                let a = core.on_incoming(&ev)?;
+                let ancestors =
+                    history_ancestors(session, p, &ev.stamp.sha256, &link.device, timeout).await;
+                let a = core.on_incoming_with(&ev, None, &ancestors)?;
                 if a.changed {
                     tracing::info!("catch-up: {}", applied_line(&ev));
                 }
                 applied += usize::from(a.changed);
                 conflicts += a.conflicts.len();
-                ack_incoming(link, &ev, &a, t0.elapsed().as_millis() as u64).await;
+                fetched += 1;
+                ack_incoming(link, &ev, &a, started.elapsed().as_millis() as u64).await;
                 publish_all(link, &a.publish).await;
             }
-            None => tracing::warn!("catch-up: hub listed {p} but returned nothing"),
+            None => {
+                tracing::warn!("catch-up: hub listed {p} but returned nothing");
+                failed += 1;
+            }
         }
     }
     let mut out = Vec::new();
@@ -907,10 +1238,9 @@ pub async fn catch_up(
     publish_all(link, &out).await;
     core.save_if_dirty()?;
     tracing::info!(
-        "catch-up from hub {}: {} stored, fetched {}, applied {}, conflicts {}, republished {}",
+        "{} (hub {}, applied {}, conflicts {}, republished {})",
+        catchup_summary(index.stamps.len(), fetched, failed, t0.elapsed()),
         index.hub,
-        index.stamps.len(),
-        fetch.len(),
         applied,
         conflicts,
         out.len()
@@ -936,6 +1266,8 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
     core.min_files = opts.min_files;
     core.program = opts.program.clone();
     core.claims_dir = Some(claims::claims_dir(&opts.state_dir));
+    core.inline_max = opts.transfer.inline_max;
+    core.chunk_size = opts.transfer.chunk_size;
     core.seeding = core.state.entries.is_empty();
     if let Some(dir) = opts.bisync_marker_dir.clone() {
         tracing::info!("bisync marker dir {}", dir.display());
@@ -967,6 +1299,7 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
         transfer: opts.transfer.clone(),
         partial_dir: opts.state_dir.join("partial"),
         device: opts.device.clone(),
+        vault: vault.clone(),
     };
     // Online: `vault/presence/<device>` token + build info.
     let _presence =
@@ -992,9 +1325,12 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
         )
         .await?
     };
-    // Finished blob fetches: (path+sha, full event if fetched).
-    let (fetched_tx, mut fetched_rx) =
-        mpsc::unbounded_channel::<(String, Option<NoteEvent>, std::time::Instant)>();
+    // Finished blob fetches: (path+sha, verified part file if fetched).
+    let (fetched_tx, mut fetched_rx) = mpsc::unbounded_channel::<(
+        String,
+        Option<(NoteEvent, blob::FetchedFile)>,
+        std::time::Instant,
+    )>();
     let mut fetching: HashSet<String> = HashSet::new();
 
     let sub = session
@@ -1016,13 +1352,47 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
     })?;
     watcher.watch(&vault, RecursiveMode::Recursive)?;
 
+    // Watch the hub liveliness token (history so a token already up is seen).
+    let hub_sub = session
+        .liveliness()
+        .declare_subscriber(presence::HUB_PRESENCE_KEY)
+        .history(true)
+        .await?;
+    let mut hub_online = false;
+    if opts.hub_wait > Duration::ZERO {
+        let deadline = tokio::time::Instant::now() + opts.hub_wait;
+        while !hub_online {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, hub_sub.recv_async()).await {
+                Ok(Ok(s)) if s.kind() == zenoh::sample::SampleKind::Put => {
+                    hub_online = true;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+    }
+    if hub_online {
+        tracing::info!("hub is online; catching up");
+    } else {
+        tracing::warn!(
+            "hub token not seen after {} s; trying catch-up anyway",
+            opts.hub_wait.as_secs()
+        );
+    }
     // Remote first, then local: incoming changes are applied (with conflict
     // copies) before offline local edits are published.
-    match catch_up(&mut core, &link, opts.query_timeout).await {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!("no hub answered the catch-up query; will retry"),
-        Err(e) => tracing::warn!("catch-up failed: {e}"),
-    }
+    let (mut catchup_failures, retry_wait) = catch_up_or_schedule(
+        &mut core,
+        &link,
+        opts.query_timeout,
+        0,
+        opts.catchup_interval,
+    )
+    .await;
     let b = core.scan()?;
     core.seeding = false;
     publish_all(&link, &b.publish).await;
@@ -1038,6 +1408,8 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
     tracing::debug!("counting routers");
     let mut routers = net::router_count(&session).await;
     tracing::debug!("entering event loop ({routers} router links)");
+    let mut retry_at = retry_wait.map(|d| tokio::time::Instant::now() + d);
+    let mut debounce_hub_at: Option<tokio::time::Instant> = None;
 
     loop {
         let debounce = tokio::time::sleep(opts.debounce);
@@ -1064,8 +1436,8 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                             let t0 = std::time::Instant::now();
                             tokio::spawn(async move {
                                 wait_for_hub(&session, &device, &ev, t.hub_wait).await;
-                                let r = match fetch_blob_with(&src, &dir, &t, &ev).await {
-                                    Ok(full) => Some(full),
+                                let r = match fetch_blob_file_with(&src, &dir, &t, &ev).await {
+                                    Ok(f) => Some((ev, f)),
                                     Err(e) => {
                                         tracing::warn!("blob for {} not fetched: {e}; catch-up retries", ev.stamp.path);
                                         let ack = TransferAck::fail(
@@ -1084,7 +1456,15 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                     }
                     Ok(ev) => {
                         let t0 = std::time::Instant::now();
-                        match core.on_incoming(&ev) {
+                        let ancestors = history_ancestors(
+                            &session,
+                            &ev.stamp.path,
+                            &ev.stamp.sha256,
+                            &link.device,
+                            opts.query_timeout,
+                        )
+                        .await;
+                        match core.on_incoming_with(&ev, None, &ancestors) {
                             Ok(a) => {
                                 if a.changed {
                                     tracing::info!("{}", applied_line(&ev));
@@ -1104,8 +1484,16 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
             }
             Some((id, done, t0)) = fetched_rx.recv() => {
                 fetching.remove(&id);
-                if let Some(ev) = done {
-                    match core.on_incoming(&ev) {
+                if let Some((ev, f)) = done {
+                    let ancestors = history_ancestors(
+                        &session,
+                        &ev.stamp.path,
+                        &ev.stamp.sha256,
+                        &link.device,
+                        opts.query_timeout,
+                    )
+                    .await;
+                    match core.on_incoming_with(&ev, Some(&f.path), &ancestors) {
                         Ok(a) => {
                             if a.changed {
                                 tracing::info!("{}", applied_line(&ev));
@@ -1118,6 +1506,7 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                             ack_fail(&link, &ev, t0.elapsed().as_millis() as u64, &e).await;
                         }
                     }
+                    f.discard();
                     core.save_if_dirty()?;
                 }
             }
@@ -1154,9 +1543,16 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                 core.save_if_dirty()?;
             }
             _ = catchup_tick.tick() => {
-                if let Err(e) = catch_up(&mut core, &link, opts.query_timeout).await {
-                    tracing::warn!("catch-up failed: {e}");
-                }
+                let (f, w) = catch_up_or_schedule(
+                    &mut core,
+                    &link,
+                    opts.query_timeout,
+                    catchup_failures,
+                    opts.catchup_interval,
+                )
+                .await;
+                catchup_failures = f;
+                retry_at = w.map(|d| tokio::time::Instant::now() + d);
             }
             _ = rescan_tick.tick() => {
                 let b = core.scan()?;
@@ -1170,13 +1566,80 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                 let n = net::router_count(&session).await;
                 if n > 0 && routers == 0 {
                     tracing::info!("hub link up; catching up");
-                    if let Err(e) = catch_up(&mut core, &link, opts.query_timeout).await {
-                        tracing::warn!("catch-up failed: {e}");
-                    }
+                    let (f, w) = catch_up_or_schedule(
+                        &mut core,
+                        &link,
+                        opts.query_timeout,
+                        catchup_failures,
+                        opts.catchup_interval,
+                    )
+                    .await;
+                    catchup_failures = f;
+                    retry_at = w.map(|d| tokio::time::Instant::now() + d);
                 } else if n == 0 && routers > 0 {
                     tracing::warn!("hub link down; local changes are kept and republished on reconnect");
                 }
                 routers = n;
+            }
+            s = hub_sub.recv_async() => {
+                let Ok(sample) = s else { continue };
+                match sample.kind() {
+                    zenoh::sample::SampleKind::Put => {
+                        if !hub_online {
+                            tracing::info!(
+                                "hub is back; catching up in {}s",
+                                opts.catchup_debounce.as_secs()
+                            );
+                            hub_online = true;
+                            debounce_hub_at =
+                                Some(tokio::time::Instant::now() + opts.catchup_debounce);
+                        }
+                    }
+                    zenoh::sample::SampleKind::Delete => {
+                        if hub_online {
+                            tracing::warn!("hub went offline");
+                            hub_online = false;
+                            debounce_hub_at = None;
+                        }
+                    }
+                }
+            }
+            _ = async {
+                if let Some(at) = debounce_hub_at {
+                    tokio::time::sleep_until(at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                debounce_hub_at = None;
+                let (f, w) = catch_up_or_schedule(
+                    &mut core,
+                    &link,
+                    opts.query_timeout,
+                    catchup_failures,
+                    opts.catchup_interval,
+                )
+                .await;
+                catchup_failures = f;
+                retry_at = w.map(|d| tokio::time::Instant::now() + d);
+            }
+            _ = async {
+                if let Some(at) = retry_at {
+                    tokio::time::sleep_until(at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                let (f, w) = catch_up_or_schedule(
+                    &mut core,
+                    &link,
+                    opts.query_timeout,
+                    catchup_failures,
+                    opts.catchup_interval,
+                )
+                .await;
+                catchup_failures = f;
+                retry_at = w.map(|d| tokio::time::Instant::now() + d);
             }
             _ = async {
                 match shutdown.as_mut() {
@@ -1737,5 +2200,28 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn catchup_backoff_steps_then_the_normal_interval() {
+        let normal = Duration::from_secs(300);
+        assert_eq!(catchup_backoff(1, normal), Duration::from_secs(2));
+        assert_eq!(catchup_backoff(2, normal), Duration::from_secs(5));
+        assert_eq!(catchup_backoff(3, normal), Duration::from_secs(10));
+        assert_eq!(catchup_backoff(4, normal), Duration::from_secs(30));
+        assert_eq!(catchup_backoff(5, normal), normal);
+        assert_eq!(catchup_backoff(0, normal), normal);
+    }
+
+    #[test]
+    fn catchup_summary_line() {
+        assert_eq!(
+            catchup_summary(1061, 4, 0, Duration::from_millis(3200)),
+            "catch-up: 1061 listed, 4 fetched, 0 failed in 3.2s"
+        );
+        assert_eq!(
+            catchup_summary(10, 0, 3, Duration::from_millis(0)),
+            "catch-up: 10 listed, 0 fetched, 3 failed in 0.0s"
+        );
     }
 }

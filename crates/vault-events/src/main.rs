@@ -103,6 +103,14 @@ enum Cmd {
         debounce_ms: u64,
         #[arg(long, default_value_t = 300)]
         catchup_secs: u64,
+        /// Seconds to wait for the hub liveliness token before the first
+        /// catch-up (then try anyway).
+        #[arg(long, default_value_t = 30)]
+        hub_wait_secs: u64,
+        /// Milliseconds to debounce a hub-token reappearance before
+        /// retriggering catch-up.
+        #[arg(long, default_value_t = 3000)]
+        catchup_debounce_ms: u64,
         #[arg(long, default_value_t = 600)]
         rescan_secs: u64,
         /// Program part of this agent's writer label (`<device>/<program>`).
@@ -290,6 +298,8 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             min_files,
             debounce_ms,
             catchup_secs,
+            hub_wait_secs,
+            catchup_debounce_ms,
             rescan_secs,
             program,
             bisync_marker_dir,
@@ -328,6 +338,8 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 program,
                 bisync_marker_dir,
                 transfer: transfer_opts(inline_max, chunk_size),
+                hub_wait: Duration::from_secs(hub_wait_secs.max(1)),
+                catchup_debounce: Duration::from_millis(catchup_debounce_ms),
             };
             agent::run(opts, None).await
         }

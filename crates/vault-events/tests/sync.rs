@@ -89,6 +89,8 @@ fn start_agent_opts(
         program: agent::DEFAULT_PROGRAM.into(),
         bisync_marker_dir,
         transfer: Default::default(),
+        hub_wait: Duration::from_secs(8),
+        catchup_debounce: Duration::from_millis(300),
     };
     let task = tokio::spawn(async move {
         agent::run(opts, Some(rx)).await.expect("agent");
@@ -744,5 +746,179 @@ async fn transfer_acks_and_who() {
     let mut names: Vec<_> = r.acks.iter().map(|a| a.device.as_str()).collect();
     names.sort();
     assert_eq!(names, vec!["dev-a", "dev-b"], "acks survive hub restart");
+    hub.stop().await;
+}
+
+/// The agent is connected only to a plain router and the hub comes up later.
+/// Catch-up must wait for the hub token, then apply the hub's notes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_catches_up_when_hub_appears() {
+    let root = tempfile::tempdir().unwrap();
+    let p = |n: &str| root.path().join(n);
+    let (hub_dir, vb, sb) = (p("hub"), p("vault-b"), p("state-b"));
+    std::fs::create_dir_all(vb.join("Notes")).unwrap();
+    let ev = event::NoteEvent::put(
+        "Notes/late.md",
+        b"from the hub\n".to_vec(),
+        "box",
+        1,
+        None,
+        1,
+    );
+    {
+        let mut store = vault_events::store::HubStore::open(&hub_dir).unwrap();
+        assert!(store.offer(&ev).unwrap());
+    }
+    let (rport, hport) = (free_port(), free_port());
+    let router = zenoh::open(net::router_config(&[format!("tcp/127.0.0.1:{rport}")], &[]).unwrap())
+        .await
+        .unwrap();
+    let b = start_agent(&vb, &sb, "towerx", rport);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        !vb.join("Notes/late.md").exists(),
+        "must not apply before the hub is up"
+    );
+    let hub = start_hub_connecting(&hub_dir, hport, vec![format!("tcp/127.0.0.1:{rport}")]);
+    wait_for("Notes/late.md after the hub appears", T, || {
+        read(vb.join("Notes/late.md")).as_deref() == Some("from the hub\n")
+    })
+    .await;
+    b.stop().await;
+    hub.stop().await;
+    router.close().await.unwrap();
+}
+
+/// After a successful catch-up, a hub restart retriggers catch-up so a
+/// note added to the store while the hub was down is fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_catches_up_when_hub_restarts() {
+    let root = tempfile::tempdir().unwrap();
+    let p = |n: &str| root.path().join(n);
+    let (hub_dir, vb, sb) = (p("hub"), p("vault-b"), p("state-b"));
+    std::fs::create_dir_all(vb.join("Notes")).unwrap();
+    let first = event::NoteEvent::put("Notes/one.md", b"one\n".to_vec(), "box", 1, None, 1);
+    {
+        let mut store = vault_events::store::HubStore::open(&hub_dir).unwrap();
+        assert!(store.offer(&first).unwrap());
+    }
+    let (rport, hport) = (free_port(), free_port());
+    let router = zenoh::open(net::router_config(&[format!("tcp/127.0.0.1:{rport}")], &[]).unwrap())
+        .await
+        .unwrap();
+    let hub = start_hub_connecting(&hub_dir, hport, vec![format!("tcp/127.0.0.1:{rport}")]);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let b = start_agent(&vb, &sb, "towerx", rport);
+    wait_for("Notes/one.md first catch-up", T, || {
+        read(vb.join("Notes/one.md")).as_deref() == Some("one\n")
+    })
+    .await;
+    hub.stop().await;
+    let second = event::NoteEvent::put("Notes/two.md", b"two\n".to_vec(), "box", 1, None, 2);
+    {
+        let mut store = vault_events::store::HubStore::open(&hub_dir).unwrap();
+        assert!(store.offer(&second).unwrap());
+    }
+    let hub = start_hub_connecting(&hub_dir, hport, vec![format!("tcp/127.0.0.1:{rport}")]);
+    wait_for("Notes/two.md after hub restart", T, || {
+        read(vb.join("Notes/two.md")).as_deref() == Some("two\n")
+    })
+    .await;
+    b.stop().await;
+    hub.stop().await;
+    router.close().await.unwrap();
+}
+
+/// Files between the old 8 MiB cap and the new 64 MiB cap travel as blobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_over_eight_mib_round_trips() {
+    let root = tempfile::tempdir().unwrap();
+    let p = |n: &str| root.path().join(n);
+    let (hub_dir, va, vb) = (p("hub"), p("vault-a"), p("vault-b"));
+    for d in [&va, &vb] {
+        std::fs::create_dir_all(d.join("Daily")).unwrap();
+    }
+    let port = free_port();
+    let hub = start_hub(&hub_dir, port);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let cap = vault_events::vault::DEFAULT_MAX_BYTES;
+    let a = start_agent_opts(&va, &p("state-a"), "box", port, None, cap);
+    let b = start_agent_opts(&vb, &p("state-b"), "towerx", port, None, cap);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let bytes = photo_bytes(20_000_000, 20);
+    let sha = event::sha256_hex(&bytes);
+    std::fs::write(va.join("Daily/big.bin"), &bytes).unwrap();
+    wait_for("20 MiB file on B", Duration::from_secs(40), || {
+        sha_of(&vb.join("Daily/big.bin")).as_deref() == Some(sha.as_str())
+    })
+    .await;
+    assert!(conflict_copies(&vb.join("Daily")).is_empty());
+    b.stop().await;
+    a.stop().await;
+    hub.stop().await;
+}
+
+/// Device holds unedited v1; hub has v3 based on v2 based on v1. Catch-up
+/// must overwrite with v3 and not write a conflict copy of v1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catch_up_does_not_conflict_on_stale_ancestor() {
+    let root = tempfile::tempdir().unwrap();
+    let p = |n: &str| root.path().join(n);
+    let (hub_dir, va, vb, sa, sb) = (
+        p("hub"),
+        p("vault-a"),
+        p("vault-b"),
+        p("state-a"),
+        p("state-b"),
+    );
+    for d in [&va, &vb] {
+        std::fs::create_dir_all(d.join("Notes")).unwrap();
+    }
+    let port = free_port();
+    let hub = start_hub(&hub_dir, port);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let a = start_agent(&va, &sa, "box", port);
+    let b = start_agent(&vb, &sb, "towerx", port);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    std::fs::write(va.join("Notes/story.md"), "v1\n").unwrap();
+    wait_for("B has v1", T, || {
+        read(vb.join("Notes/story.md")).as_deref() == Some("v1\n")
+    })
+    .await;
+    b.stop().await;
+    std::fs::write(va.join("Notes/story.md"), "v2\n").unwrap();
+    let t = Instant::now();
+    loop {
+        if hub_version(port, "Notes/story.md").await == Some(2) {
+            break;
+        }
+        if t.elapsed() > T {
+            panic!("timed out waiting for hub v2");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::write(va.join("Notes/story.md"), "v3\n").unwrap();
+    let t = Instant::now();
+    loop {
+        if hub_version(port, "Notes/story.md").await == Some(3) {
+            break;
+        }
+        if t.elapsed() > T {
+            panic!("timed out waiting for hub v3");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let b = start_agent(&vb, &sb, "towerx", port);
+    wait_for("B fast-forwards to v3", T, || {
+        read(vb.join("Notes/story.md")).as_deref() == Some("v3\n")
+    })
+    .await;
+    assert!(
+        conflict_copies(&vb.join("Notes")).is_empty(),
+        "stale v1 must not become a conflict copy: {:?}",
+        conflict_copies(&vb.join("Notes"))
+    );
+    a.stop().await;
+    b.stop().await;
     hub.stop().await;
 }

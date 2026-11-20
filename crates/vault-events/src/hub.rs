@@ -1,7 +1,7 @@
 //! The hub: an embedded Zenoh router plus the note storage that answers
 //! catch-up queries, and (optionally) the one-way Drive backup.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -116,6 +116,24 @@ pub async fn run(
         session.zid(),
         opts.listen
     );
+    let _hub_alive = match session
+        .liveliness()
+        .declare_token(presence::HUB_PRESENCE_KEY)
+        .await
+    {
+        Ok(tok) => Some(tok),
+        Err(e) => {
+            tracing::warn!("hub liveliness token not declared: {e}");
+            None
+        }
+    };
+    {
+        let session = session.clone();
+        let connect = opts.connect.clone();
+        tokio::spawn(async move {
+            log_link_events(session, connect).await;
+        });
+    }
 
     let sub = session.declare_subscriber(key::NOTES_WILDCARD).await?;
     let notes_q = session
@@ -221,19 +239,21 @@ pub async fn run(
                             let src = ZenohSource::for_hub(session.clone(), &opts.transfer, &ev.stamp.origin, "hub");
                             let (tx, dir, topts) = (pulled_tx.clone(), partial_dir.clone(), opts.transfer.clone());
                             tokio::spawn(async move {
-                                let res = blob::fetch(&src, &dir, &sha, &info, &topts).await;
+                                let res = blob::fetch_file(&src, &dir, &sha, &info, &topts).await;
                                 let done = match res {
-                                    Ok(f) => match blobs.put(&f.bytes) {
+                                    Ok(f) => match blobs.put_file(&sha, &f.path, false) {
                                         Ok(_) => {
                                             tracing::info!(
                                                 "pulled blob {} for {}: {} B, {} chunks in {} ms ({} resumed, {} retried), sha256 ok",
-                                                short(&sha), ev.stamp.path, f.bytes.len(), f.chunks,
+                                                short(&sha), ev.stamp.path, f.size, f.chunks,
                                                 f.elapsed.as_millis(), f.resumed, f.retries
                                             );
+                                            f.discard();
                                             Some(ev)
                                         }
                                         Err(e) => {
                                             tracing::error!("saving blob {} failed: {e}", short(&sha));
+                                            f.discard();
                                             None
                                         }
                                     },
@@ -479,6 +499,41 @@ fn run_backup(cfg_file: &std::path::Path, dry_run: bool) -> Result<i32, BoxError
         tracing::info!("{l}");
     }
     Ok(code)
+}
+
+/// Log router/peer link up/down in plain words. Zenoh's transport-event
+/// API needs the `unstable` crate feature; we poll `routers_zid` /
+/// `peers_zid` instead and include the hub's `--connect` list so a drop
+/// can be matched to note4c vs another endpoint.
+async fn log_link_events(session: zenoh::Session, connect: Vec<String>) {
+    let hint = if connect.is_empty() {
+        String::new()
+    } else {
+        format!(", hub connects to [{}]", connect.join(", "))
+    };
+    let mut prev: HashMap<String, String> = HashMap::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tick.tick().await;
+        let mut now: HashMap<String, String> = HashMap::new();
+        for z in session.info().routers_zid().await {
+            now.insert(z.to_string(), "router".into());
+        }
+        for z in session.info().peers_zid().await {
+            now.entry(z.to_string()).or_insert_with(|| "peer".into());
+        }
+        for (zid, kind) in &now {
+            if !prev.contains_key(zid) {
+                tracing::info!("link up: {kind} {zid}{hint}");
+            }
+        }
+        for (zid, kind) in &prev {
+            if !now.contains_key(zid) {
+                tracing::warn!("link down: {kind} {zid}{hint}");
+            }
+        }
+        prev = now;
+    }
 }
 
 #[cfg(test)]

@@ -6,9 +6,11 @@
 //! with Zenoh queries on `vault/blob/<sha256>/<index>?cs=<chunk_size>`:
 //!
 //! - the hub answers from its content-addressed blob directory;
-//! - the sending agent answers from a short-lived in-memory cache of the
-//!   files it just published, so the hub (and early receivers) can pull
-//!   the bytes before the hub has them.
+//! - the sending agent answers by reading the needed chunk from the file
+//!   on disk (after streaming a SHA-256 check that the file still matches),
+//!   so a 64 MiB publish never holds the whole file in RAM. A small
+//!   in-memory cache is kept only for tests and already-buffered tiny
+//!   files.
 //!
 //! Each query names who should answer with a `src` parameter
 //! (`?cs=<chunk_size>;src=<who>`): `hub`, the sending device, or `any`.
@@ -270,6 +272,37 @@ impl BlobDir {
         Ok(Some((buf, size)))
     }
 
+    /// Install a verified file as blob `sha` (copy + rename). If `sha`
+    /// is already stored, this is a no-op. The file is hashed by streaming
+    /// if the caller passes `verify = true`.
+    pub fn put_file(&self, sha: &str, src: &Path, verify: bool) -> io::Result<()> {
+        if !is_sha256_hex(sha) {
+            return Err(io::Error::other(format!("bad blob sha {sha}")));
+        }
+        let p = self.path(sha);
+        if p.is_file() {
+            return Ok(());
+        }
+        if verify {
+            let got = crate::event::sha256_file(src)?;
+            if got != sha {
+                return Err(io::Error::other(format!("blob {sha}: file hash is {got}")));
+            }
+        }
+        let tmp = self.dir.join(format!("{sha}.tmp"));
+        let res = (|| {
+            let mut inp = fs::File::open(src)?;
+            let mut out = fs::File::create(&tmp)?;
+            io::copy(&mut inp, &mut out)?;
+            out.sync_all()?;
+            fs::rename(&tmp, &p)
+        })();
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        res
+    }
+
     pub fn remove(&self, sha: &str) -> io::Result<()> {
         match fs::remove_file(self.path(sha)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -290,12 +323,37 @@ impl BlobDir {
     }
 }
 
-/// Files this agent published as blob references, kept in memory for a
-/// while so the hub (and other devices) can pull them. Bounded by total
-/// bytes and age; the hub keeps its own copy once it has pulled it.
-/// `(sha256, bytes, inserted)`.
-type CacheEntry = (String, Arc<Vec<u8>>, Instant);
+/// How a published blob is served.
+enum CacheBody {
+    /// Read chunks from this file after a streaming SHA-256 check.
+    File {
+        path: PathBuf,
+        size: u64,
+        /// Last metadata used for a successful hash check.
+        checked: Option<(u64, std::time::SystemTime)>,
+    },
+    /// Small already-buffered file (tests / tiny payloads). Bounded by
+    /// [`OutgoingCache::max_bytes`].
+    Bytes(Arc<Vec<u8>>),
+}
 
+impl CacheBody {
+    fn mem_bytes(&self) -> u64 {
+        match self {
+            CacheBody::Bytes(b) => b.len() as u64,
+            CacheBody::File { .. } => 0,
+        }
+    }
+}
+
+/// `(sha256, body, inserted)`.
+type CacheEntry = (String, CacheBody, Instant);
+
+/// Files this agent published as blob references. The usual entry is a
+/// path on disk: chunks are read as 256 KiB ranges after a streaming
+/// SHA-256 check that the file still matches. A small in-memory bound
+/// covers tests and already-buffered tiny files; a full 64 MiB file is
+/// never held in RAM.
 pub struct OutgoingCache {
     inner: Mutex<VecDeque<CacheEntry>>,
     /// sha256 -> vault path, for the `served blob` log line.
@@ -303,6 +361,9 @@ pub struct OutgoingCache {
     max_bytes: u64,
     ttl: Duration,
 }
+
+/// In-memory part of the cache (not on-disk entries): 8 MiB.
+pub const OUTGOING_MEM_MAX: u64 = 8 << 20;
 
 impl OutgoingCache {
     pub fn new(max_bytes: u64, ttl: Duration) -> Self {
@@ -314,21 +375,7 @@ impl OutgoingCache {
         }
     }
 
-    pub fn insert(&self, sha: &str, bytes: Vec<u8>) {
-        let mut q = self.inner.lock().expect("cache lock");
-        q.retain(|(s, _, _)| s != sha);
-        q.push_back((sha.to_string(), Arc::new(bytes), Instant::now()));
-        let mut total: u64 = q.iter().map(|(_, b, _)| b.len() as u64).sum();
-        while total > self.max_bytes && q.len() > 1 {
-            if let Some((_, b, _)) = q.pop_front() {
-                total -= b.len() as u64;
-            }
-        }
-    }
-
-    /// [`Self::insert`], remembering the vault path for log lines.
-    pub fn insert_named(&self, sha: &str, path: &str, bytes: Vec<u8>) {
-        self.insert(sha, bytes);
+    fn remember_name(&self, sha: &str, vault_path: &str) {
         let live: BTreeSet<String> = self
             .inner
             .lock()
@@ -338,7 +385,47 @@ impl OutgoingCache {
             .collect();
         let mut n = self.names.lock().expect("names lock");
         n.retain(|s, _| live.contains(s));
-        n.insert(sha.to_string(), path.to_string());
+        n.insert(sha.to_string(), vault_path.to_string());
+    }
+
+    fn push(&self, sha: &str, body: CacheBody) {
+        let mut q = self.inner.lock().expect("cache lock");
+        q.retain(|(s, _, _)| s != sha);
+        q.push_back((sha.to_string(), body, Instant::now()));
+        let mut total: u64 = q.iter().map(|(_, b, _)| b.mem_bytes()).sum();
+        while total > self.max_bytes && q.len() > 1 {
+            if let Some((_, b, _)) = q.pop_front() {
+                total = total.saturating_sub(b.mem_bytes());
+            }
+        }
+    }
+
+    /// Serve chunks from `path` (a vault file). `vault_path` is the
+    /// relative path for log lines.
+    pub fn insert_file(&self, sha: &str, path: impl AsRef<Path>, vault_path: &str) {
+        let path = path.as_ref().to_path_buf();
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.push(
+            sha,
+            CacheBody::File {
+                path,
+                size,
+                checked: None,
+            },
+        );
+        self.remember_name(sha, vault_path);
+    }
+
+    /// Small in-memory insert (tests). Large buffers are not kept: the
+    /// caller should use [`Self::insert_file`].
+    pub fn insert(&self, sha: &str, bytes: Vec<u8>) {
+        self.push(sha, CacheBody::Bytes(Arc::new(bytes)));
+    }
+
+    /// [`Self::insert`], remembering the vault path for log lines.
+    pub fn insert_named(&self, sha: &str, path: &str, bytes: Vec<u8>) {
+        self.insert(sha, bytes);
+        self.remember_name(sha, path);
     }
 
     /// Vault path a cached blob was published for.
@@ -346,29 +433,72 @@ impl OutgoingCache {
         self.names.lock().expect("names lock").get(sha).cloned()
     }
 
-    /// Chunk `i` plus the whole blob's size.
+    /// Refresh TTL filter; return a mutable entry if still live.
+    fn get_live<'a>(
+        q: &'a mut VecDeque<CacheEntry>,
+        ttl: Duration,
+        sha: &str,
+    ) -> Option<&'a mut CacheEntry> {
+        q.retain(|(_, _, t)| t.elapsed() < ttl);
+        q.iter_mut().find(|(s, _, _)| s == sha)
+    }
+
+    /// Chunk `i` plus the whole blob's size. For a file entry, hashes the
+    /// file (streamed) if it was never checked or its mtime/size changed,
+    /// and serves only when the SHA-256 still matches.
     pub fn chunk_sized(&self, sha: &str, i: u64, chunk_size: u64) -> Option<(Vec<u8>, u64)> {
-        let b = self.get(sha)?;
-        let (off, len) = chunk_range(b.len() as u64, chunk_size, i)?;
-        Some((
-            b[off as usize..(off + len) as usize].to_vec(),
-            b.len() as u64,
-        ))
+        let mut q = self.inner.lock().expect("cache lock");
+        let ttl = self.ttl;
+        let e = Self::get_live(&mut q, ttl, sha)?;
+        match &mut e.1 {
+            CacheBody::Bytes(b) => {
+                let (off, len) = chunk_range(b.len() as u64, chunk_size, i)?;
+                Some((
+                    b[off as usize..(off + len) as usize].to_vec(),
+                    b.len() as u64,
+                ))
+            }
+            CacheBody::File {
+                path,
+                size,
+                checked,
+            } => {
+                let md = fs::metadata(&*path).ok()?;
+                let mtime = md.modified().ok()?;
+                let fresh = md.len() == *size
+                    && checked
+                        .as_ref()
+                        .is_some_and(|(sz, t)| *sz == md.len() && *t == mtime);
+                if !fresh {
+                    let got = crate::event::sha256_file(path).ok()?;
+                    if got != sha {
+                        return None;
+                    }
+                    *size = md.len();
+                    *checked = Some((md.len(), mtime));
+                }
+                let (off, len) = chunk_range(*size, chunk_size, i)?;
+                let mut f = fs::File::open(&*path).ok()?;
+                f.seek(SeekFrom::Start(off)).ok()?;
+                let mut buf = vec![0u8; len as usize];
+                f.read_exact(&mut buf).ok()?;
+                Some((buf, *size))
+            }
+        }
     }
 
     pub fn get(&self, sha: &str) -> Option<Arc<Vec<u8>>> {
         let mut q = self.inner.lock().expect("cache lock");
         let ttl = self.ttl;
-        q.retain(|(_, _, t)| t.elapsed() < ttl);
-        q.iter()
-            .find(|(s, _, _)| s == sha)
-            .map(|(_, b, _)| b.clone())
+        let e = Self::get_live(&mut q, ttl, sha)?;
+        match &e.1 {
+            CacheBody::Bytes(b) => Some(b.clone()),
+            CacheBody::File { .. } => None,
+        }
     }
 
     pub fn chunk(&self, sha: &str, i: u64, chunk_size: u64) -> Option<Vec<u8>> {
-        let b = self.get(sha)?;
-        let (off, len) = chunk_range(b.len() as u64, chunk_size, i)?;
-        Some(b[off as usize..(off + len) as usize].to_vec())
+        self.chunk_sized(sha, i, chunk_size).map(|(b, _)| b)
     }
 
     pub fn len(&self) -> usize {
@@ -381,9 +511,9 @@ impl OutgoingCache {
 }
 
 impl Default for OutgoingCache {
-    /// 256 MiB, 30 minutes.
+    /// 8 MiB in-memory bound, 30 minutes.
     fn default() -> Self {
-        OutgoingCache::new(256 << 20, Duration::from_secs(30 * 60))
+        OutgoingCache::new(OUTGOING_MEM_MAX, Duration::from_secs(30 * 60))
     }
 }
 
@@ -473,21 +603,34 @@ impl Assembler {
         Ok(true)
     }
 
+    /// All chunks there: stream-hash the part file. `Ok(Ok(path))` leaves
+    /// the part in place for the caller to install; `Ok(Err(got_sha))` on
+    /// a mismatch, after which every chunk is missing again.
+    pub fn finish_verified(&mut self) -> io::Result<Result<PathBuf, String>> {
+        if !self.missing().is_empty() {
+            return Err(io::Error::other("finish() with chunks missing"));
+        }
+        let got = crate::event::sha256_file(&self.part)?;
+        let len = fs::metadata(&self.part)?.len();
+        if got != self.sha || len != self.size {
+            self.reset()?;
+            return Ok(Err(got));
+        }
+        Ok(Ok(self.part.clone()))
+    }
+
     /// All chunks there: verify. `Ok(Ok(bytes))` and the partial files are
     /// gone; `Ok(Err(got_sha))` on a mismatch, after which the assembler
     /// starts over (every chunk missing).
     pub fn finish(&mut self) -> io::Result<Result<Vec<u8>, String>> {
-        if !self.missing().is_empty() {
-            return Err(io::Error::other("finish() with chunks missing"));
+        match self.finish_verified()? {
+            Ok(p) => {
+                let bytes = fs::read(&p)?;
+                self.discard();
+                Ok(Ok(bytes))
+            }
+            Err(got) => Ok(Err(got)),
         }
-        let bytes = fs::read(&self.part)?;
-        let got = sha256_hex(&bytes);
-        if got != self.sha || bytes.len() as u64 != self.size {
-            self.reset()?;
-            return Ok(Err(got));
-        }
-        self.discard();
-        Ok(Ok(bytes))
     }
 
     /// Forget every chunk (fresh, zero-filled part file of the right size).
@@ -562,15 +705,34 @@ pub struct Fetched {
     pub elapsed: Duration,
 }
 
-/// Pull blob `sha` (`info`) chunk by chunk from `src` into `partial_dir`,
-/// asking again only for missing chunks, and return the verified bytes.
-pub async fn fetch<S: ChunkSource>(
+/// A verified blob on disk (the assembler part file). Install it, then
+/// delete the part and the sibling `.have` file.
+pub struct FetchedFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub chunks: u64,
+    pub resumed: u64,
+    pub retries: u64,
+    pub elapsed: Duration,
+}
+
+impl FetchedFile {
+    /// Remove the part file and its `.have` sidecar.
+    pub fn discard(&self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(self.path.with_extension("have"));
+    }
+}
+
+/// Pull blob `sha` into `partial_dir` and return the verified part file
+/// (hashed by streaming, not loaded into RAM).
+pub async fn fetch_file<S: ChunkSource>(
     src: &S,
     partial_dir: &Path,
     sha: &str,
     info: &BlobInfo,
     opts: &TransferOpts,
-) -> Result<Fetched, FetchError> {
+) -> Result<FetchedFile, FetchError> {
     let t0 = Instant::now();
     let cs = info.chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
     let mut asm = Assembler::open(partial_dir, sha, info.size, cs)?;
@@ -603,10 +765,11 @@ pub async fn fetch<S: ChunkSource>(
             }
         }
         if asm.missing().is_empty() {
-            match asm.finish()? {
-                Ok(bytes) => {
-                    return Ok(Fetched {
-                        bytes,
+            match asm.finish_verified()? {
+                Ok(path) => {
+                    return Ok(FetchedFile {
+                        path,
+                        size: info.size,
                         chunks: asm.chunks(),
                         resumed,
                         retries,
@@ -636,6 +799,27 @@ pub async fn fetch<S: ChunkSource>(
             chunks: asm.chunks(),
         }),
     }
+}
+
+/// Pull blob `sha` (`info`) chunk by chunk from `src` into `partial_dir`,
+/// asking again only for missing chunks, and return the verified bytes.
+pub async fn fetch<S: ChunkSource>(
+    src: &S,
+    partial_dir: &Path,
+    sha: &str,
+    info: &BlobInfo,
+    opts: &TransferOpts,
+) -> Result<Fetched, FetchError> {
+    let f = fetch_file(src, partial_dir, sha, info, opts).await?;
+    let bytes = fs::read(&f.path)?;
+    f.discard();
+    Ok(Fetched {
+        bytes,
+        chunks: f.chunks,
+        resumed: f.resumed,
+        retries: f.retries,
+        elapsed: f.elapsed,
+    })
 }
 
 /// [`ChunkSource`] over a Zenoh session. Tries the `src` values in order
@@ -1400,5 +1584,38 @@ mod tests {
         short_lived.insert("x", vec![1]);
         std::thread::sleep(Duration::from_millis(5));
         assert!(short_lived.get("x").is_none(), "expired");
+    }
+
+    #[test]
+    fn outgoing_cache_serves_from_disk_after_hash_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("photo.bin");
+        let bytes = data(20_000);
+        std::fs::write(&p, &bytes).unwrap();
+        let sha = sha256_hex(&bytes);
+        let c = OutgoingCache::new(1024, Duration::from_secs(60));
+        c.insert_file(&sha, &p, "Daily/photo.bin");
+        assert!(c.get(&sha).is_none(), "file entries are not held in RAM");
+        assert_eq!(c.chunk(&sha, 1, 4096).unwrap(), bytes[4096..8192].to_vec());
+        assert_eq!(c.name(&sha).as_deref(), Some("Daily/photo.bin"));
+        // A rewrite with different bytes is not served.
+        let other = bytes.iter().map(|b| !b).collect::<Vec<_>>();
+        std::fs::write(&p, &other).unwrap();
+        // Same-size rewrite can keep the previous mtime on a coarse FS;
+        // bump it so the cache re-hashes.
+        let later = std::time::SystemTime::now() + Duration::from_secs(2);
+        std::fs::File::open(&p)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(c.chunk(&sha, 0, 4096).is_none(), "sha no longer matches");
+        // Restored file is served again.
+        std::fs::write(&p, &bytes).unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(4);
+        std::fs::File::open(&p)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(c.chunk(&sha, 0, 4096).unwrap(), bytes[..4096].to_vec());
     }
 }

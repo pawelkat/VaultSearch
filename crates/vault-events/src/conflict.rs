@@ -19,7 +19,10 @@
 //!    [`Stamp::beats`]. The winner stays at / goes to the live path; the
 //!    loser's bytes are saved as a conflict copy.
 //! 4. Disk is clean: if the incoming event was based on what we have
-//!    (`prev_sha256 == state.sha256`) it is a fast-forward -> `Apply`.
+//!    (`prev_sha256 == state.sha256`, or the disk / last-known sha is an
+//!    ancestor of the incoming event) it is a fast-forward -> `Apply`.
+//!    A device that missed intermediate versions (local still at v1,
+//!    incoming is v3 based on v2) must not write a conflict copy of v1.
 //!    Otherwise two devices edited the same base concurrently and the
 //!    incoming one won the tie-break: our current bytes are saved as a
 //!    conflict copy, then the incoming state is applied.
@@ -59,6 +62,20 @@ pub fn decide(
     me: &str,
     local_ts_ms: u64,
 ) -> Decision {
+    decide_with(state, disk, incoming, me, local_ts_ms, &[])
+}
+
+/// [`decide`], with hub-history ancestor SHAs of `incoming` (not including
+/// the incoming sha itself). A local file whose sha equals the last-known
+/// synced sha or any ancestor is a fast-forward, not a conflict.
+pub fn decide_with(
+    state: Option<&Stamp>,
+    disk: Option<&str>,
+    incoming: &Stamp,
+    me: &str,
+    local_ts_ms: u64,
+    ancestors: &[&str],
+) -> Decision {
     let incoming_sha = if incoming.deleted {
         None
     } else {
@@ -80,6 +97,16 @@ pub fn decide(
     }
     let state_sha = state.and_then(|s| (!s.deleted).then_some(s.sha256.as_str()));
     let dirty = disk != state_sha;
+
+    // Stale ancestor: the file (or the last stamp we accepted) is an older
+    // version of incoming. Fast-forward; do not write a conflict copy.
+    if is_ancestor(disk, incoming, ancestors)
+        || (!dirty && is_ancestor(state_sha, incoming, ancestors))
+    {
+        return Decision::Apply {
+            save_local_as: None,
+        };
+    }
 
     if dirty {
         // 3. Concurrent local edit (or an untracked local file).
@@ -126,6 +153,14 @@ pub fn decide(
             }
         }
     }
+}
+
+/// `sha` is `incoming.prev_sha256` or appears in the hub history chain.
+fn is_ancestor(sha: Option<&str>, incoming: &Stamp, ancestors: &[&str]) -> bool {
+    let Some(sha) = sha else {
+        return false;
+    };
+    incoming.prev_sha256.as_deref() == Some(sha) || ancestors.contains(&sha)
 }
 
 /// Keep device ids filename-safe.
@@ -483,5 +518,77 @@ mod tests {
             }
         }
         assert!(n > 0);
+    }
+
+    #[test]
+    fn stale_ancestor_is_a_fast_forward() {
+        // Agent accepted v1, disk still holds unedited v1; incoming is v3
+        // (based on v2, based on v1) — the TowerX catch-up case.
+        let st = put("v1", "box", 1, None, DAY);
+        let inc = put("v3", "box", 3, Some("v2"), DAY + 2);
+        let v1 = sha256_hex_s("v1");
+        let v2 = sha256_hex_s("v2");
+        assert!(inc.beats(&st));
+        // Without the ancestor list, prev is v2 not v1: a false conflict.
+        assert_eq!(
+            decide(Some(&st), Some(&v1), &inc, "towerx", DAY),
+            Decision::Apply {
+                save_local_as: Some(conflict_name(&st))
+            }
+        );
+        // With history [v2, v1], overwrite and no copy.
+        assert_eq!(
+            decide_with(Some(&st), Some(&v1), &inc, "towerx", DAY, &[&v2, &v1]),
+            Decision::Apply {
+                save_local_as: None
+            }
+        );
+        // State lost (fresh agent) but the file is still v1.
+        assert_eq!(
+            decide_with(None, Some(&v1), &inc, "towerx", DAY, &[&v2, &v1]),
+            Decision::Apply {
+                save_local_as: None
+            }
+        );
+        // A real local edit is not an ancestor: still a conflict.
+        let dirty = sha256_hex_s("edited locally");
+        let d = decide_with(
+            Some(&st),
+            Some(&dirty),
+            &inc,
+            "towerx",
+            DAY + 9,
+            &[&v2, &v1],
+        );
+        assert!(
+            matches!(
+                d,
+                Decision::Apply {
+                    save_local_as: Some(_)
+                } | Decision::KeepLocal { .. }
+            ),
+            "unique local edit still conflicts: {d:?}"
+        );
+        // Concurrent published edit (our v2 vs their v2, ancestors = [base]):
+        // disk equals last-known sha, but that sha is not an ancestor.
+        let ours = put("ours", "box", 2, Some("v1"), DAY + 1);
+        let theirs = put("theirs", "s24", 2, Some("v1"), DAY + 1);
+        let ours_sha = sha256_hex_s("ours");
+        let base = sha256_hex_s("v1");
+        if theirs.beats(&ours) {
+            assert_eq!(
+                decide_with(
+                    Some(&ours),
+                    Some(&ours_sha),
+                    &theirs,
+                    "box",
+                    DAY + 1,
+                    &[&base]
+                ),
+                Decision::Apply {
+                    save_local_as: Some(conflict_name(&ours))
+                }
+            );
+        }
     }
 }

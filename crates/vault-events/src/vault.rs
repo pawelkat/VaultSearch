@@ -1,17 +1,17 @@
 //! Filesystem side of the agent: which files sync, hashing, atomic writes.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::event::sha256_hex;
+use crate::event::{sha256_file, sha256_hex};
 use crate::key;
 
 /// Prefix of the agent's own temp files (never synced, never watched).
 pub const TMP_PREFIX: &str = ".vault-events-tmp-";
 /// Default per-file size cap. Larger files stay on the Drive fallback path.
-pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What is on disk at a vault path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,27 @@ impl Disk {
     pub fn sha(&self) -> Option<&str> {
         match self {
             Disk::Present { sha256, .. } => Some(sha256),
+            _ => None,
+        }
+    }
+}
+
+/// Metadata of a vault path, hashed by streaming (no whole-file buffer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inspect {
+    Absent,
+    Skipped(String),
+    Present {
+        sha256: String,
+        mtime_ms: u64,
+        size: u64,
+    },
+}
+
+impl Inspect {
+    pub fn sha(&self) -> Option<&str> {
+        match self {
+            Inspect::Present { sha256, .. } => Some(sha256),
             _ => None,
         }
     }
@@ -184,6 +205,91 @@ impl VaultFs {
         })
     }
 
+    /// Hash a vault path by streaming; never holds the whole file in RAM.
+    pub fn inspect(&self, rel: &str) -> io::Result<Inspect> {
+        if is_ignored(rel) {
+            return Ok(Inspect::Skipped("ignored path".into()));
+        }
+        let p = self.abs(rel)?;
+        let md = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Inspect::Absent),
+            Err(e) => return Err(e),
+        };
+        if md.file_type().is_symlink() {
+            return Ok(Inspect::Skipped("symlink".into()));
+        }
+        if !md.is_file() {
+            return Ok(Inspect::Skipped("not a regular file".into()));
+        }
+        if md.len() > self.max_bytes {
+            return Ok(Inspect::Skipped(format!(
+                "{} bytes > max {}",
+                md.len(),
+                self.max_bytes
+            )));
+        }
+        let sha256 = match sha256_file(&p) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Inspect::Absent),
+            Err(e) => return Err(e),
+        };
+        Ok(Inspect::Present {
+            sha256,
+            size: md.len(),
+            mtime_ms: mtime_ms(&md),
+        })
+    }
+
+    /// `len` bytes at `off`, or `None` if the file is missing or too short.
+    pub fn read_range(&self, rel: &str, off: u64, len: u64) -> io::Result<Option<Vec<u8>>> {
+        let p = self.abs(rel)?;
+        let mut f = match fs::File::open(&p) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; len as usize];
+        match f.read_exact(&mut buf) {
+            Ok(()) => Ok(Some(buf)),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Copy `src` into the vault via a same-directory temp file + rename.
+    pub fn write_atomic_from(&self, rel: &str, src: &Path) -> io::Result<()> {
+        let p = self.abs(rel)?;
+        if let Ok(md) = fs::symlink_metadata(&p) {
+            if !md.is_file() {
+                return Err(io::Error::other(format!(
+                    "refusing to replace non-file {}",
+                    p.display()
+                )));
+            }
+        }
+        let dir = p.parent().unwrap_or(&self.root);
+        fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(
+            "{TMP_PREFIX}{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let res = (|| {
+            let mut inp = fs::File::open(src)?;
+            let mut out = fs::File::create(&tmp)?;
+            io::copy(&mut inp, &mut out)?;
+            out.sync_all()?;
+            fs::rename(&tmp, &p)
+        })();
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        res
+    }
+
     /// Write via a temp file in the same directory + rename, so readers
     /// (Obsidian, vault-searchd) never see a half-written note.
     pub fn write_atomic(&self, rel: &str, bytes: &[u8]) -> io::Result<()> {
@@ -260,16 +366,20 @@ impl VaultFs {
     /// candidate already holds exactly these bytes (copy already made,
     /// possibly by another device).
     pub fn conflict_slot(&self, base: &str, bytes: &[u8]) -> io::Result<Option<String>> {
-        let want = sha256_hex(bytes);
+        self.conflict_slot_sha(base, &sha256_hex(bytes))
+    }
+
+    /// [`Self::conflict_slot`] from a SHA-256, without loading the candidate.
+    pub fn conflict_slot_sha(&self, base: &str, want: &str) -> io::Result<Option<String>> {
         for n in 1..1000 {
             let cand = if n == 1 {
                 base.to_string()
             } else {
                 numbered(base, n)
             };
-            match self.read(&cand)? {
-                Disk::Absent => return Ok(Some(cand)),
-                Disk::Present { sha256, .. } if sha256 == want => return Ok(None),
+            match self.inspect(&cand)? {
+                Inspect::Absent => return Ok(Some(cand)),
+                Inspect::Present { sha256, .. } if sha256 == want => return Ok(None),
                 _ => continue,
             }
         }

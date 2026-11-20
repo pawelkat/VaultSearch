@@ -17,6 +17,9 @@
 //! base concurrently both publish `n + 1`; [`Stamp::rank`] breaks the tie
 //! deterministically (see [`Stamp::beats`]).
 
+use std::io::{self, Read};
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -238,14 +241,36 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// Lower-case hex SHA-256.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let d = Sha256::digest(bytes);
+fn sha256_hex_digest(d: sha2::digest::Output<Sha256>) -> String {
     let mut s = String::with_capacity(64);
     for b in d {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Lower-case hex SHA-256.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    sha256_hex_digest(Sha256::digest(bytes))
+}
+
+/// SHA-256 of a reader, 64 KiB at a time (never holds the whole input).
+pub fn sha256_reader(mut r: impl Read) -> io::Result<String> {
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(sha256_hex_digest(h.finalize()))
+}
+
+/// SHA-256 of a file, streamed.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    sha256_reader(std::fs::File::open(path)?)
 }
 
 /// 64 lower-case hex digits.
@@ -288,6 +313,39 @@ impl NoteEvent {
             content: Some(content),
             conflict: None,
             blob: None,
+        }
+    }
+
+    /// A blob-reference event (no inline content) for a file already hashed
+    /// on disk. `size` is the file length; `chunk_size` is announced to
+    /// receivers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blob_put(
+        path: &str,
+        sha256: String,
+        size: u64,
+        chunk_size: u64,
+        origin: &str,
+        version: u64,
+        prev_sha256: Option<String>,
+        ts_ms: u64,
+    ) -> Self {
+        NoteEvent {
+            format: FORMAT_VERSION,
+            stamp: Stamp {
+                path: path.to_string(),
+                version,
+                ts_ms,
+                origin: origin.to_string(),
+                deleted: false,
+                sha256,
+                prev_sha256,
+                writer: None,
+                cause: None,
+            },
+            content: None,
+            conflict: None,
+            blob: Some(BlobInfo::new(size, chunk_size)),
         }
     }
 

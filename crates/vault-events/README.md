@@ -173,10 +173,15 @@ request:
     served blob e1936f74b612 (Notes/x.bin) to towerx: 10/10 chunks, 2621440 B in 3.1 s
     served blob e1936f74b612 (Notes/x.bin) to s24: partial 4/10 chunks, 1048576 B in 2.0 s, idle
 
-Catch-up index queries log `catch-up from towerx: 1057 listed`; note and
-history queries only at debug.
+Catch-up index queries log `catch-up from towerx: 1057 listed`; after each
+pass the agent logs `catch-up: N listed, M fetched, K failed in Xs (...)`.
+Note and history queries only at debug. An instant empty index reply is
+logged as `(no route)` and retried on the short backoff.
 
-Presence: each agent (and VaultHome) declares the liveliness token
+Presence: the hub declares a liveliness token on `vault/hub/presence`
+(same key as its presence queryable, so it does not collide with the box
+agent's `vault/presence/box`). Each agent (and VaultHome) declares the
+liveliness token
 `vault/presence/<device>` and answers a queryable on the same key with
 `{device, role, build, started_ms}` (`build` = `vault-events
 <crate version>+<git short sha>` or `vaulthome <versionName>+<sha>`). The
@@ -220,7 +225,7 @@ Tombstones are kept in hub storage indefinitely in stage 1.
 
 ## What syncs
 
-Regular files up to `--max-bytes` (default 8 MiB). Larger files, symlinks,
+Regular files up to `--max-bytes` (default 64 MiB). Larger files, symlinks,
 anything under a dot-directory or dotfile (`.obsidian/`, `.trash/`, `.git/`),
 except the `.grok/skills/` allow-list (shared agent skills: every regular file
 under it syncs, but other `.grok/` content and nested dot segments such as
@@ -230,7 +235,10 @@ bisync's own conflict losers (`*.conflict-*`, `*..conflict-*`, `*.conflictN`;
 each bisync device makes its own, and syncing them spread them to every
 device), and the agent's own `.vault-events-tmp-*` files do not. The agent's
 own `(conflict <origin> <date>)` copies do sync. A conflict copy is never
-made when both sides hold the same bytes. Files above the inline limit
+made when both sides hold the same bytes, when the local file's SHA-256 equals
+the incoming event or any ancestor in the hub history for that path, or when
+the disk still matches the agent's last-known synced SHA and that SHA is an
+ancestor (a stale fast-forward, e.g. local v1 vs incoming v3). Files above the inline limit
 (1 MiB) up to `--max-bytes` sync as blob references plus chunks; larger
 files stay on the Drive fallback path.
 
@@ -264,17 +272,24 @@ vault-events agent --vault ~/Obsidian/Vault --device box \
                    [--connect tcp/127.0.0.1:7447] [--state-dir ~/.local/share/vault-events/agent]
 ```
 
-Start-up: open a Zenoh client session (retries every 10 s while the hub is
-unreachable), subscribe, start the `notify` watcher, **catch up** (fetch the
-hub index; fetch and apply every note the hub has newer, tombstones included;
-republish the states the hub lacks or has older **that this device made**, or
-files changed on disk since they were recorded), then **scan** the vault and
-publish local changes made while the agent was down. Then:
+Start-up: open a Zenoh client session (retries every 10 s while the router is
+unreachable), subscribe, start the `notify` watcher, wait up to
+`--hub-wait-secs` (30) for the hub's liveliness token on `vault/hub/presence`
+(history is on, so a token already present is seen at once), then **catch up**
+(fetch the hub index; fetch and apply every note the hub has newer, tombstones
+included; republish the states the hub lacks or has older **that this device
+made**, or files changed on disk since they were recorded), then **scan** the
+vault and publish local changes made while the agent was down. If the wait
+expires with no token, catch-up still runs and retries. Then:
 
 - watcher events are debounced (`--debounce-ms`, 750) and published;
 - incoming samples are applied with the rules above;
-- catch-up repeats every `--catchup-secs` (300) and whenever the router link
-  comes back; a full rescan runs every `--rescan-secs` (600).
+- catch-up repeats every `--catchup-secs` (300), whenever the hub token
+  reappears after a drop (debounced `--catchup-debounce-ms`, 3000), and on a
+  short backoff (2, 5, 10, 30 s, then the normal interval) when a catch-up
+  fails or returns instantly empty (no route). Each listed note or blob is
+  retried a few times in the same pass. A full rescan runs every
+  `--rescan-secs` (600).
 
 Catch-up never relays another device's state (its edits, deletes or conflict
 copies), even when the hub lacks it: the device that made it republishes it
