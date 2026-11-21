@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""Checksum two-way sync between a local vault and an rclone remote.
+
+Compares md5 hashes (not mtimes), so a box re-image does not look like
+a full rewrite. Intended to replace rclone bisync on the box.
+
+Usage: vault-md5sync [--dry-run] [--loop] [--config FILE]
+
+Reads the same vault-rclone config.env (VAULT_LOCAL, VAULT_REMOTE,
+RCLONE_BIN, MAX_DELETE, MIN_FILES, SYNC_LOG, FILTERS_FILE). Always
+passes --disable-http2. State: ~/.local/share/vault-md5sync/state.json
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Europe/Zurich")
+STATE_DIR = Path.home() / ".local/share/vault-md5sync"
+STATE_PATH = STATE_DIR / "state.json"
+LOCK_PATH = STATE_DIR / "vault-md5sync.lock"
+LOOP_PID = STATE_DIR / "loop.pid"
+DEFAULT_CONFIGS = (
+    Path.home() / ".config/vault-rclone/config.env",
+    Path.home() / ".config/vault-sync/config.env",
+)
+DEFAULT_EXCLUDES = (
+    ".obsidian/workspace*",
+    ".obsidian/cache/**",
+    ".trash/**",
+    "**/.trash/**",
+    "**/*.conflict-*",
+)
+MAX_BACKOFF_SEC = 6 * 60 * 60
+MIN_BACKOFF_SEC = 10 * 60
+LOOP_SLEEP_SEC = 10 * 60
+RATE_RE = re.compile(
+    r"(?i)(\b403\b|rateLimit|rate_limit|userRateLimitExceeded|quotaExceeded)"
+)
+
+
+def now() -> datetime:
+    return datetime.now(TZ)
+
+
+def ts_stamp(dt: datetime | None = None) -> str:
+    return (dt or now()).strftime("%Y%m%d-%H%M")
+
+
+def iso(dt: datetime | None = None) -> str:
+    return (dt or now()).isoformat(timespec="seconds")
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for raw in path.read_text(errors="replace").splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[7:].strip()
+        if "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
+def load_config(explicit: str | None) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    if explicit:
+        merged.update(load_dotenv(Path(explicit).expanduser()))
+    else:
+        # vault-rclone: vault-sync then vault-rclone (latter wins), then env.
+        for p in (DEFAULT_CONFIGS[1], DEFAULT_CONFIGS[0]):
+            merged.update(load_dotenv(p))
+    for k, v in os.environ.items():
+        if k in {
+            "VAULT_LOCAL",
+            "VAULT_REMOTE",
+            "RCLONE_BIN",
+            "MAX_DELETE",
+            "MIN_FILES",
+            "SYNC_LOG",
+            "FILTERS_FILE",
+        }:
+            merged[k] = v
+    return merged
+
+
+def require(cfg: dict[str, str], key: str) -> str:
+    val = (cfg.get(key) or "").strip()
+    if not val:
+        raise SystemExit(f"vault-md5sync: missing {key} in config")
+    return val
+
+
+class Logger:
+    def __init__(self, path: Path | None):
+        self.path = path
+        if path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+    def line(self, msg: str) -> None:
+        text = f"{iso()} {msg}"
+        print(text, flush=True)
+        if not self.path:
+            return
+        try:
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            print(f"{iso()} log-write-failed: {e}", file=sys.stderr)
+
+
+def load_state() -> dict:
+    if not STATE_PATH.is_file():
+        return {"files": {}, "acked_remote": {}, "backoff_sec": 0}
+    try:
+        data = json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"files": {}, "acked_remote": {}, "backoff_sec": 0}
+    data.setdefault("files", {})
+    data.setdefault("acked_remote", {})
+    data.setdefault("backoff_sec", 0)
+    return data
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    tmp.replace(STATE_PATH)
+
+
+def rclone_cmd(bin_path: str, *args: str) -> list[str]:
+    return [bin_path, "--disable-http2", *args]
+
+
+def is_rate_error(text: str) -> bool:
+    return bool(RATE_RE.search(text))
+
+
+def run_rclone(bin_path: str, args: list[str], log: Logger) -> subprocess.CompletedProcess:
+    cmd = rclone_cmd(bin_path, *args)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def parse_md5sum(text: str) -> dict[str, set[str]]:
+    """path -> set of md5s. Drive allows duplicate names in one folder."""
+    out: dict[str, set[str]] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # "HASH  path" (two spaces) or "HASH path"
+        if "  " in line:
+            digest, path = line.split("  ", 1)
+        elif " " in line:
+            digest, path = line.split(" ", 1)
+        else:
+            continue
+        digest, path = digest.strip(), path.strip().lstrip("./")
+        if not path or not re.fullmatch(r"[0-9a-fA-F]{32}", digest):
+            continue
+        out.setdefault(path, set()).add(digest.lower())
+    return out
+
+
+def one_hash(hashes: dict[str, set[str]], path: str) -> str | None:
+    vals = hashes.get(path) or set()
+    if not vals:
+        return None
+    return next(iter(vals))
+
+
+def any_match(local_hash: str | None, remote_hashes: set[str] | None) -> bool:
+    return bool(local_hash and remote_hashes and local_hash in remote_hashes)
+
+
+def filter_args(cfg: dict[str, str]) -> list[str]:
+    f = (cfg.get("FILTERS_FILE") or "").strip()
+    if f and Path(f).is_file():
+        return ["--filter-from", f]
+    args: list[str] = []
+    for pat in DEFAULT_EXCLUDES:
+        args.extend(["--exclude", pat])
+    return args
+
+
+def md5_listing(bin_path: str, target: str, cfg: dict[str, str], log: Logger) -> dict[str, set[str]]:
+    proc = run_rclone(bin_path, ["md5sum", target, *filter_args(cfg)], log)
+    err = (proc.stderr or "") + (proc.stdout or "")
+    if proc.returncode != 0:
+        if is_rate_error(err):
+            raise RateLimitError(err.strip()[:200])
+        raise RuntimeError(f"rclone md5sum failed exit={proc.returncode}")
+    return parse_md5sum(proc.stdout or "")
+
+
+class RateLimitError(Exception):
+    pass
+
+
+def conflict_name(path: str, dt: datetime | None = None) -> str:
+    p = Path(path)
+    stamp = ts_stamp(dt)
+    if p.suffix:
+        return str(p.with_name(f"{p.stem}.conflict-{stamp}{p.suffix}"))
+    return str(p) + f".conflict-{stamp}.md"
+
+
+def plan_actions(
+    local: dict[str, set[str]],
+    remote: dict[str, set[str]],
+    state: dict,
+) -> list[dict]:
+    prev: dict[str, str] = dict(state.get("files") or {})
+    acked: dict[str, str] = dict(state.get("acked_remote") or {})
+    first = not prev
+    actions: list[dict] = []
+    for path in sorted(set(local) | set(remote) | set(prev)):
+        lh = one_hash(local, path)
+        rh = remote.get(path) or set()
+        s = prev.get(path)
+        if any_match(lh, rh):
+            continue
+        if first:
+            if lh and rh:
+                actions.append({"op": "conflict", "path": path})
+            elif rh and not lh:
+                actions.append({"op": "pull", "path": path})
+            elif lh and not rh:
+                actions.append({"op": "push", "path": path})
+            continue
+        if rh and not lh:
+            if s is None or s in rh:
+                if s in rh:
+                    actions.append({"op": "delete-remote", "path": path})
+                else:
+                    actions.append({"op": "pull", "path": path})
+            else:
+                # local gone, remote changed: keep remote
+                actions.append({"op": "pull", "path": path})
+            continue
+        if lh and not rh:
+            if s is None or s == lh:
+                if s == lh:
+                    actions.append({"op": "delete-local", "path": path})
+                else:
+                    actions.append({"op": "push", "path": path})
+            else:
+                actions.append({"op": "push", "path": path})
+            continue
+        if lh and rh and lh not in rh:
+            if acked.get(path) in rh and s == lh:
+                # already recorded this remote version as a conflict
+                continue
+            if s == lh:
+                actions.append({"op": "pull", "path": path})
+            elif s in rh:
+                actions.append({"op": "push", "path": path})
+            else:
+                # both changed, or no matching baseline
+                actions.append({"op": "conflict", "path": path})
+    return actions
+
+
+def backup_dir(run_ts: str) -> Path:
+    return STATE_DIR / "backup" / run_ts
+
+
+def copy_to_backup(src: Path, rel: str, bdir: Path, log: Logger) -> None:
+    dest = bdir / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_file():
+        shutil.copy2(src, dest)
+
+
+def rclone_copyto(bin_path: str, src: str, dst: str, log: Logger) -> None:
+    proc = run_rclone(bin_path, ["copyto", src, dst], log)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        if is_rate_error(err):
+            raise RateLimitError(err[:200])
+        raise RuntimeError(f"rclone copyto failed exit={proc.returncode}")
+
+
+def rclone_deletefile(bin_path: str, target: str, log: Logger) -> None:
+    proc = run_rclone(bin_path, ["deletefile", target], log)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        if is_rate_error(err):
+            raise RateLimitError(err[:200])
+        raise RuntimeError(f"rclone deletefile failed exit={proc.returncode}")
+
+
+def apply_actions(
+    actions: list[dict],
+    cfg: dict[str, str],
+    local_root: Path,
+    remote: str,
+    bin_path: str,
+    dry_run: bool,
+    log: Logger,
+    local_hashes: dict[str, set[str]],
+    remote_hashes: dict[str, set[str]],
+) -> tuple[int, int, int, int]:
+    run_ts = ts_stamp()
+    bdir = backup_dir(run_ts)
+    n_pull = n_push = n_del = n_conflict = 0
+    for act in actions:
+        op, path = act["op"], act["path"]
+        local_path = local_root / path
+        remote_path = f"{remote}/{path}"
+        if dry_run:
+            extra = ""
+            if op == "conflict":
+                extra = f" -> {conflict_name(path)}"
+            print(f"DRY {op} {path}{extra}", flush=True)
+            if op == "pull":
+                n_pull += 1
+            elif op == "push":
+                n_push += 1
+            elif op.startswith("delete"):
+                n_del += 1
+            else:
+                n_conflict += 1
+            continue
+        if op == "pull":
+            if local_path.is_file():
+                copy_to_backup(local_path, path, bdir, log)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            rclone_copyto(bin_path, remote_path, str(local_path), log)
+            n_pull += 1
+        elif op == "push":
+            if path in remote_hashes:
+                bak = bdir / path
+                bak.parent.mkdir(parents=True, exist_ok=True)
+                rclone_copyto(bin_path, remote_path, str(bak), log)
+            rclone_copyto(bin_path, str(local_path), remote_path, log)
+            n_push += 1
+        elif op == "delete-local":
+            if local_path.is_file():
+                copy_to_backup(local_path, path, bdir, log)
+                local_path.unlink()
+            n_del += 1
+        elif op == "delete-remote":
+            bak = bdir / path
+            bak.parent.mkdir(parents=True, exist_ok=True)
+            rclone_copyto(bin_path, remote_path, str(bak), log)
+            rclone_deletefile(bin_path, remote_path, log)
+            n_del += 1
+        elif op == "conflict":
+            cpath = conflict_name(path)
+            cfull = local_root / cpath
+            cfull.parent.mkdir(parents=True, exist_ok=True)
+            rclone_copyto(bin_path, remote_path, str(cfull), log)
+            n_conflict += 1
+            act["conflict_path"] = cpath
+            print(f"conflict {path} -> {cpath}", flush=True)
+    return n_pull, n_push, n_del, n_conflict
+
+
+def new_state_hashes(
+    local: dict[str, set[str]],
+    remote: dict[str, set[str]],
+    actions: list[dict],
+    prev: dict,
+    dry_run: bool,
+) -> tuple[dict[str, str], dict[str, str]]:
+    files = dict(prev.get("files") or {})
+    acked = dict(prev.get("acked_remote") or {})
+    if dry_run:
+        return files, acked
+    # Prefer the local hash when both sides share it; otherwise the
+    # single remaining hash. Duplicate Drive names share one path.
+    files = {}
+    for path in set(local) | set(remote):
+        lh = one_hash(local, path)
+        rh = remote.get(path) or set()
+        if any_match(lh, rh):
+            files[path] = lh  # type: ignore[assignment]
+        elif lh:
+            files[path] = lh
+        elif len(rh) == 1:
+            files[path] = next(iter(rh))
+    for act in actions:
+        path = act["path"]
+        op = act["op"]
+        if op == "pull":
+            rh = remote.get(path) or set()
+            if len(rh) == 1:
+                files[path] = next(iter(rh))
+            acked.pop(path, None)
+        elif op == "push":
+            lh = one_hash(local, path)
+            if lh:
+                files[path] = lh
+            acked.pop(path, None)
+        elif op in {"delete-local", "delete-remote"}:
+            files.pop(path, None)
+            acked.pop(path, None)
+        elif op == "conflict":
+            lh = one_hash(local, path)
+            if lh:
+                files[path] = lh
+            rh = remote.get(path) or set()
+            if rh:
+                acked[path] = next(iter(rh))
+    for path in list(acked):
+        if path not in files:
+            acked.pop(path, None)
+    return files, acked
+
+
+def record_backoff(state: dict, log: Logger) -> None:
+    prev = int(state.get("backoff_sec") or 0)
+    delay = MIN_BACKOFF_SEC if prev <= 0 else min(prev * 2, MAX_BACKOFF_SEC)
+    nxt = now() + timedelta(seconds=delay)
+    state["backoff_sec"] = delay
+    state["next_ok_at"] = iso(nxt)
+    save_state(state)
+    log.line(f"rate-limit backoff {delay}s next_ok_at={state['next_ok_at']}")
+
+
+def skipped_for_backoff(state: dict, log: Logger) -> bool:
+    raw = state.get("next_ok_at")
+    if not raw:
+        return False
+    try:
+        nxt = datetime.fromisoformat(raw)
+        if nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=TZ)
+    except ValueError:
+        return False
+    if now() < nxt:
+        log.line(f"skip until next_ok_at={raw}")
+        return True
+    return False
+
+
+def sync_once(cfg: dict[str, str], dry_run: bool, log: Logger) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = load_state()
+    if skipped_for_backoff(state, log):
+        return 0
+
+    bin_path = require(cfg, "RCLONE_BIN")
+    local_root = Path(require(cfg, "VAULT_LOCAL")).expanduser()
+    remote = require(cfg, "VAULT_REMOTE").rstrip("/")
+    try:
+        max_delete = int(cfg.get("MAX_DELETE") or "50")
+    except ValueError:
+        max_delete = 50
+    try:
+        min_files = int(cfg.get("MIN_FILES") or "0")
+    except ValueError:
+        min_files = 0
+
+    log.line(f"start dry_run={int(dry_run)} first_run={int(not state.get('files'))}")
+    try:
+        local_hashes = md5_listing(bin_path, str(local_root), cfg, log)
+        remote_hashes = md5_listing(bin_path, remote, cfg, log)
+    except RateLimitError:
+        record_backoff(state, log)
+        return 2
+    except RuntimeError as e:
+        log.line(f"error {e}")
+        return 1
+
+    n_dup = sum(1 for hs in remote_hashes.values() if len(hs) > 1)
+    if n_dup:
+        log.line(f"remote duplicate names={n_dup}")
+
+    if min_files and (len(local_hashes) < min_files or len(remote_hashes) < min_files):
+        log.line(
+            f"abort: listing below MIN_FILES "
+            f"(local={len(local_hashes)} remote={len(remote_hashes)})"
+        )
+        return 1
+
+    actions = plan_actions(local_hashes, remote_hashes, state)
+    deletes = [a for a in actions if a["op"].startswith("delete")]
+    if len(deletes) > max_delete:
+        log.line(f"abort: planned deletes {len(deletes)} exceed MAX_DELETE")
+        return 1
+
+    try:
+        n_pull, n_push, n_del, n_conflict = apply_actions(
+            actions,
+            cfg,
+            local_root,
+            remote,
+            bin_path,
+            dry_run,
+            log,
+            local_hashes,
+            remote_hashes,
+        )
+    except RateLimitError:
+        record_backoff(state, log)
+        return 2
+    except RuntimeError as e:
+        log.line(f"error {e}")
+        return 1
+
+    if not dry_run:
+        files, acked = new_state_hashes(local_hashes, remote_hashes, actions, state, False)
+        state["files"] = files
+        state["acked_remote"] = acked
+        state["backoff_sec"] = 0
+        state.pop("next_ok_at", None)
+        state["last_run"] = iso()
+        save_state(state)
+
+    log.line(
+        f"end exit=0 pull={n_pull} push={n_push} delete={n_del} "
+        f"conflict={n_conflict} local={len(local_hashes)} "
+        f"remote={len(remote_hashes)} planned={len(actions)} dry_run={int(dry_run)}"
+    )
+    return 0
+
+
+def acquire_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise SystemExit("vault-md5sync: already running")
+    return fh
+
+
+def run_loop(cfg: dict[str, str], dry_run: bool, log: Logger) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOOP_PID.write_text(str(os.getpid()))
+    log.line(f"loop started pid={os.getpid()} interval={LOOP_SLEEP_SEC}s")
+    try:
+        while True:
+            lock = None
+            try:
+                lock = acquire_lock()
+                sync_once(cfg, dry_run, log)
+            except SystemExit as e:
+                msg = str(e)
+                if "already running" in msg:
+                    log.line("loop: run skipped (lock held)")
+                else:
+                    raise
+            finally:
+                if lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                        lock.close()
+                    except OSError:
+                        pass
+            time.sleep(LOOP_SLEEP_SEC)
+    finally:
+        try:
+            if LOOP_PID.is_file() and LOOP_PID.read_text().strip() == str(os.getpid()):
+                LOOP_PID.unlink()
+        except OSError:
+            pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Checksum two-way vault sync")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--loop", action="store_true", help="run every 10 minutes")
+    ap.add_argument("--config", help="vault-rclone config.env path")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    log_path = (cfg.get("SYNC_LOG") or "").strip()
+    log = Logger(Path(log_path).expanduser() if log_path else None)
+
+    if args.loop:
+        return run_loop(cfg, args.dry_run, log) or 0
+
+    lock = acquire_lock()
+    try:
+        return sync_once(cfg, args.dry_run, log)
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
