@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::io::Read;
 
-use vault_events::{ack, agent, blob, claims, event, hub, key, net, presence, vault};
+use vault_events::{ack, agent, blob, claims, event, hub, key, net, power, presence, vault};
 
 #[derive(Parser)]
 #[command(
@@ -179,6 +179,25 @@ enum Cmd {
         #[arg(long)]
         summary: bool,
         /// Requester name sent as `from=` (shows in the hub log).
+        #[arg(long, default_value = net::CLI_REQUESTER)]
+        device: String,
+    },
+    /// TowerX power through the ESP32 board (`devices/<target>-power`):
+    /// checks the board's liveliness, then calls the note4c bridge.
+    /// `status` also reports whether TowerX is available for Ask.
+    Power {
+        /// Machine, e.g. `towerx`.
+        target: String,
+        /// `status`, `on` (500 ms tap) or `off` (6 s force-off, needs --yes).
+        action: String,
+        /// Confirm `off`.
+        #[arg(long)]
+        yes: bool,
+        /// TowerX chat proxy health URL (llama-server + vault-searchd).
+        #[arg(long, env = "TOWERX_HEALTH_URL", default_value = power::TOWERX_HEALTH_URL)]
+        health_url: String,
+        #[arg(long, default_values_t = [format!("tcp/127.0.0.1:{}", net::DEFAULT_PORT)])]
+        connect: Vec<String>,
         #[arg(long, default_value = net::CLI_REQUESTER)]
         device: String,
     },
@@ -572,6 +591,73 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 println!("{line}");
             }
             Ok(())
+        }
+        Cmd::Power {
+            target,
+            action,
+            yes,
+            health_url,
+            connect,
+            device,
+        } => {
+            let act = power::Action::parse(&action)
+                .ok_or_else(|| format!("action must be status, on or off (got {action})"))?;
+            let payload = act.payload(yes)?;
+            let id = power::device_id(&target);
+            let s = zenoh::open(net::client_config(&connect)?).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let t = Duration::from_secs(5);
+            let esp = power::token_alive(&s, &power::token_key(&id), t).await;
+            println!(
+                "esp32 {}: {}",
+                power::token_key(&id),
+                if esp { "alive" } else { "offline" }
+            );
+            if !esp {
+                s.close().await?;
+                return Err(
+                    format!("{id} has no liveliness token: board offline, nothing sent").into(),
+                );
+            }
+            let r = power::call(
+                &s,
+                &id,
+                act.tool(),
+                payload,
+                &device,
+                Duration::from_secs(15),
+            )
+            .await;
+            let agent = if act == power::Action::Status && target == power::TOWERX_AGENT {
+                Some(power::agent_alive(&s, t).await)
+            } else {
+                None
+            };
+            s.close().await?;
+            match &r {
+                Ok(text) => println!("{}: {text}", act.tool()),
+                Err(e) => println!("{}: failed ({e})", act.tool()),
+            }
+            if let Some(agent) = agent {
+                let health = power::http_health(&health_url, Duration::from_secs(5));
+                println!(
+                    "towerx agent vault/presence/towerx: {}",
+                    if agent { "alive" } else { "offline" }
+                );
+                match &health {
+                    Ok(b) => println!("towerx health {health_url}: ok {b}"),
+                    Err(e) => println!("towerx health {health_url}: down ({e})"),
+                }
+                println!(
+                    "towerx ask: {}",
+                    if power::ask_available(agent, health.is_ok()) {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                );
+            }
+            r.map(|_| ())
         }
         Cmd::Peers { connect, device } => {
             let s = zenoh::open(net::client_config(&connect)?).await?;
