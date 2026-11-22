@@ -387,6 +387,46 @@ def rewrite_chat(body: bytes, now: datetime, note: str) -> bytes:
     return json.dumps(updated).encode("utf-8")
 
 
+def vault_searchd_ok() -> tuple[bool, str]:
+    """`vault-searchd status` against the socket the vault_search tool uses."""
+    binary = os.environ.get(
+        "VAULT_SEARCHD", str(Path.home() / ".local/bin/vault-searchd")
+    )
+    try:
+        done = subprocess.run(
+            [binary, "status", "--socket", search_socket()],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if done.returncode != 0:
+        return False, (done.stderr or done.stdout or "").strip()[:200]
+    return True, "ok"
+
+
+def health_verdict(llama_status: int | None, searchd_ok: bool) -> tuple[int, dict]:
+    """Ask may use this host only when llama-server and vault-searchd are both up.
+
+    200 = ready; 503 = llama-server loading or vault-searchd down; 502 = no llama-server.
+    """
+    llama = (
+        "ok"
+        if llama_status == 200
+        else "loading"
+        if llama_status == 503
+        else "down"
+    )
+    searchd = "ok" if searchd_ok else "down"
+    body = {"status": "ok", "llama": llama, "vault_searchd": searchd}
+    if llama == "ok" and searchd_ok:
+        return 200, body
+    body["status"] = "loading" if llama == "loading" and searchd_ok else "error"
+    return (502 if llama == "down" else 503), body
+
+
 def _upstream_parts() -> tuple[str, int]:
     parts = urlsplit(UPSTREAM)
     return parts.hostname or "127.0.0.1", parts.port or 80
@@ -399,14 +439,40 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
 
     def do_GET(self) -> None:
-        if self._serve_vault(head=False):
+        if self._health(head=False) or self._serve_vault(head=False):
             return
         self._proxy()
 
     def do_HEAD(self) -> None:
-        if self._serve_vault(head=True):
+        if self._health(head=True) or self._serve_vault(head=True):
             return
         self._proxy()
+
+    def _health(self, head: bool) -> bool:
+        if self.path.split("?", 1)[0].rstrip("/") != "/health":
+            return False
+        host, port = _upstream_parts()
+        conn = HTTPConnection(host, port, timeout=5)
+        try:
+            conn.request("GET", "/health")
+            llama_status: int | None = conn.getresponse().status
+        except OSError:
+            llama_status = None
+        finally:
+            conn.close()
+        searchd_ok, searchd_detail = vault_searchd_ok()
+        code, body = health_verdict(llama_status, searchd_ok)
+        if not searchd_ok:
+            body["vault_searchd_detail"] = searchd_detail
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not head:
+            self.wfile.write(data)
+        return True
 
     def _serve_vault(self, head: bool) -> bool:
         path = unquote(self.path.split("?", 1)[0])
@@ -653,6 +719,13 @@ def self_test() -> None:
         assert resolve_vault_file(root, "/vault/../secret.md") is None
         assert resolve_vault_file(root, "/health") is None
         assert not outside.exists() or resolve_vault_file(root, "/vault/../secret.md") is None
+    assert health_verdict(200, True)[0] == 200
+    assert health_verdict(200, False) == (
+        503,
+        {"status": "error", "llama": "ok", "vault_searchd": "down"},
+    )
+    assert health_verdict(503, True)[1]["status"] == "loading"
+    assert health_verdict(None, True)[0] == 502
     print("self-test ok")
 
 
