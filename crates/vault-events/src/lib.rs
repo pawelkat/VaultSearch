@@ -10,7 +10,6 @@
 //! - [`hub`]: embedded Zenoh router + storage queryables (+ Drive backup).
 //! - [`agent`]: `notify` watcher that publishes saves and applies events.
 //! - [`presence`]: liveliness tokens, `device online/offline`, `peers`.
-//! - [`power`]: TowerX power board over Zenoh + Ask availability.
 //!
 //! See the crate README for the topology and the box setup.
 
@@ -24,7 +23,6 @@ pub mod history;
 pub mod hub;
 pub mod key;
 pub mod net;
-pub mod power;
 pub mod presence;
 pub mod state;
 pub mod store;
