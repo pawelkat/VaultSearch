@@ -175,11 +175,28 @@ def parse_md5sum(text: str) -> dict[str, set[str]]:
             digest, path = line.split(" ", 1)
         else:
             continue
-        digest, path = digest.strip(), path.strip().lstrip("./")
+        digest, path = digest.strip(), normalize_path(path)
         if not path or not re.fullmatch(r"[0-9a-fA-F]{32}", digest):
             continue
         out.setdefault(path, set()).add(digest.lower())
     return out
+
+
+def normalize_path(path: str) -> str:
+    """Keep hidden paths like .grok/...; only strip a ./ prefix, not a leading dot."""
+    path = path.strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path.lstrip("/")
+
+
+def state_lookup(prev: dict[str, str], path: str) -> str | None:
+    """Read a state hash, including keys stripped of a leading '.' by older builds."""
+    if path in prev:
+        return prev[path]
+    if path.startswith(".") and not path.startswith("./") and path[1:] in prev:
+        return prev[path[1:]]
+    return None
 
 
 def one_hash(hashes: dict[str, set[str]], path: str) -> str | None:
@@ -237,7 +254,7 @@ def plan_actions(
     for path in sorted(set(local) | set(remote) | set(prev)):
         lh = one_hash(local, path)
         rh = remote.get(path) or set()
-        s = prev.get(path)
+        s = state_lookup(prev, path)
         if any_match(lh, rh):
             continue
         if first:
@@ -268,7 +285,7 @@ def plan_actions(
                 actions.append({"op": "push", "path": path})
             continue
         if lh and rh and lh not in rh:
-            if acked.get(path) in rh and s == lh:
+            if state_lookup(acked, path) in rh and s == lh:
                 # already recorded this remote version as a conflict
                 continue
             if s == lh:
@@ -292,22 +309,35 @@ def copy_to_backup(src: Path, rel: str, bdir: Path, log: Logger) -> None:
         shutil.copy2(src, dest)
 
 
+def rclone_errmsg(proc: subprocess.CompletedProcess, what: str, *targets: str) -> str:
+    err = (proc.stderr or proc.stdout or "").strip()
+    lines = [
+        ln for ln in err.splitlines()
+        if "client_id" not in ln.lower() and "NOTICE:" not in ln
+    ]
+    snippet = "; ".join(lines)[:300]
+    joined = " ".join(targets)
+    if snippet:
+        return f"rclone {what} failed exit={proc.returncode} {joined}: {snippet}"
+    return f"rclone {what} failed exit={proc.returncode} {joined}"
+
+
 def rclone_copyto(bin_path: str, src: str, dst: str, log: Logger) -> None:
     proc = run_rclone(bin_path, ["copyto", src, dst], log)
     if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        if is_rate_error(err):
-            raise RateLimitError(err[:200])
-        raise RuntimeError(f"rclone copyto failed exit={proc.returncode}")
+        msg = rclone_errmsg(proc, "copyto", src, "->", dst)
+        if is_rate_error(msg):
+            raise RateLimitError(msg[:200])
+        raise RuntimeError(msg)
 
 
 def rclone_deletefile(bin_path: str, target: str, log: Logger) -> None:
     proc = run_rclone(bin_path, ["deletefile", target], log)
     if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        if is_rate_error(err):
-            raise RateLimitError(err[:200])
-        raise RuntimeError(f"rclone deletefile failed exit={proc.returncode}")
+        msg = rclone_errmsg(proc, "deletefile", target)
+        if is_rate_error(msg):
+            raise RateLimitError(msg[:200])
+        raise RuntimeError(msg)
 
 
 def apply_actions(
