@@ -15,6 +15,11 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
+use git_analyzer::{
+    chunk_code, clamp_k as clamp_code_k, code_document_prefix, code_query_prefix,
+    collect_tracked_files, format_code_hits, read_code_text, require_index_outside_root, CodeIndex,
+    CodeStamp, FileId,
+};
 use vault_rclone::reindex::ReindexReply;
 use vault_rclone::SystemRunner;
 use vault_search::{
@@ -43,6 +48,13 @@ enum Cmd {
     Reindex(ReindexArgs),
     /// Print a running daemon's index, embedder, and sync health.
     Status(StatusArgs),
+    /// Index git-tracked code under a projects root, then exit.
+    /// Does not listen and does not touch the vault index.
+    #[command(name = "code-index")]
+    CodeIndex(CodeIndexArgs),
+    /// Embed one code-retrieval query against a code index, then exit.
+    #[command(name = "code-query")]
+    CodeQuery(CodeQueryArgs),
 }
 
 #[derive(clap::Args)]
@@ -100,6 +112,34 @@ struct QueryArgs {
 }
 
 #[derive(clap::Args)]
+struct CodeIndexArgs {
+    /// Directory of git repositories. Read-only. Tracked files only.
+    #[arg(long)]
+    root: PathBuf,
+    /// sqlite file. Must not live inside --root.
+    #[arg(long)]
+    index: PathBuf,
+    #[arg(long, default_value = "http://127.0.0.1:8081/v1/embeddings")]
+    embed_url: String,
+    /// Stored width. 768 for EmbeddingGemma 2 on this PC.
+    #[arg(long, default_value_t = 768)]
+    dim: usize,
+}
+
+#[derive(clap::Args)]
+struct CodeQueryArgs {
+    query: String,
+    #[arg(long)]
+    index: PathBuf,
+    #[arg(long, default_value = "http://127.0.0.1:8081/v1/embeddings")]
+    embed_url: String,
+    #[arg(long, default_value_t = 768)]
+    dim: usize,
+    #[arg(long)]
+    k: Option<u32>,
+}
+
+#[derive(clap::Args)]
 struct ReindexArgs {
     #[arg(long)]
     socket: Option<PathBuf>,
@@ -115,6 +155,8 @@ fn main() {
         Cmd::Query(args) => query(args),
         Cmd::Reindex(args) => reindex_client(args),
         Cmd::Status(args) => status_client(args),
+        Cmd::CodeIndex(args) => code_index(args),
+        Cmd::CodeQuery(args) => code_query(args),
     };
     if let Err(err) = result {
         eprintln!("vault-searchd: {err}");
@@ -448,6 +490,110 @@ fn reindex_inner(app: &App) -> Result<(), String> {
         }
     }
     app.index.delete(&plan.delete).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn code_index(args: CodeIndexArgs) -> Result<(), String> {
+    let root = std::path::absolute(&args.root).map_err(|err| err.to_string())?;
+    if !root.is_dir() {
+        return Err(format!(
+            "projects root is not a directory: {}",
+            root.display()
+        ));
+    }
+    require_index_outside_root(&root, &args.index).map_err(|err| err.to_string())?;
+    let files = collect_tracked_files(&root).map_err(|err| err.to_string())?;
+    let index = CodeIndex::open(&args.index, args.dim).map_err(|err| err.to_string())?;
+    let embedder = HttpEmbedder::new(&args.embed_url)?;
+    let stamps = files
+        .iter()
+        .map(|file| CodeStamp {
+            repo: file.repo.clone(),
+            path: file.path.clone(),
+            mtime_ns: file.mtime_ns,
+        })
+        .collect::<Vec<_>>();
+    let plan = index.plan(&stamps).map_err(|err| err.to_string())?;
+    let by_id = files
+        .iter()
+        .map(|file| {
+            (
+                FileId {
+                    repo: file.repo.clone(),
+                    path: file.path.clone(),
+                },
+                file,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for file_id in &plan.embed {
+        let Some(file) = by_id.get(file_id) else {
+            continue;
+        };
+        let text = read_code_text(&file.full_path).map_err(|err| err.to_string())?;
+        let Some(text) = text else {
+            index
+                .delete(std::slice::from_ref(file_id))
+                .map_err(|err| err.to_string())?;
+            continue;
+        };
+        let chunks = chunk_code(&file.repo, &file.path, &text);
+        if chunks.is_empty() {
+            index
+                .delete(std::slice::from_ref(file_id))
+                .map_err(|err| err.to_string())?;
+            continue;
+        }
+        let inputs = chunks
+            .iter()
+            .map(|chunk| code_document_prefix(chunk.title(), &chunk.text))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "embed {}/{} ({} chunks)",
+            file.repo,
+            file.path,
+            inputs.len()
+        );
+        let vectors = embed_batched(&embedder, &inputs, args.dim)?;
+        index
+            .upsert(
+                &CodeStamp {
+                    repo: file.repo.clone(),
+                    path: file.path.clone(),
+                    mtime_ns: file.mtime_ns,
+                },
+                &chunks,
+                &vectors,
+            )
+            .map_err(|err| err.to_string())?;
+    }
+    index.delete(&plan.delete).map_err(|err| err.to_string())?;
+    let repos = files
+        .iter()
+        .map(|file| file.repo.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    println!(
+        "code-index: repos={repos} files={} chunks={} embedded={} deleted={}",
+        index.file_count().map_err(|err| err.to_string())?,
+        index.chunk_count().map_err(|err| err.to_string())?,
+        plan.embed.len(),
+        plan.delete.len()
+    );
+    Ok(())
+}
+
+fn code_query(args: CodeQueryArgs) -> Result<(), String> {
+    let index = CodeIndex::open(&args.index, args.dim).map_err(|err| err.to_string())?;
+    let embedder = HttpEmbedder::new(&args.embed_url)?;
+    let vectors = embedder.embed(&[code_query_prefix(&args.query)], index.dim())?;
+    let Some(vector) = vectors.into_iter().next() else {
+        return Err("embedder returned no vector".to_string());
+    };
+    let hits = index
+        .search(&vector, clamp_code_k(args.k))
+        .map_err(|err| err.to_string())?;
+    println!("{}", format_code_hits(&hits));
     Ok(())
 }
 

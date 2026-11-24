@@ -105,6 +105,31 @@ The generated package is `com.pawelkat.vaultsearch`. `cargo-ndk` and the Android
 | `vault-search-mcp` | Line-delimited JSON-RPC, protocol `2024-11-05`. |
 | `vault-rclone` | Vault-only wrapper around the `rclone` binary. |
 
+## Code index
+
+Desktop only. Markdown chunking and the vault prefixes are unchanged. The `git-analyzer` crate lists tracked files with `git ls-files` (the working tree, not untracked files, not ignored files). It skips a NUL byte, files over 1 MB, lockfiles, and secret-like names (`.env`, `*.pem`, key files) even when those files are tracked. `.github` is kept when git tracks it. `.git` is never indexed.
+
+Chunks are line windows of 80 lines with 15 lines of overlap, cut so each chunk stays under 6000 characters. That fits inside EmbeddingGemma 2's 8K-token window. Each chunk stores the repo, path, line range, language, and an optional symbol (the first function or type in the window).
+
+The strings sent to the embedder are the code-retrieval prefixes, not the vault ones:
+
+- query: `task: code retrieval | query: {query}`
+- document: `title: {symbol or filename} | text: {code}`
+
+The sqlite file must sit outside the projects root. These commands exit when they finish. They do not listen on the vault socket and they do not start sync.
+
+```bash
+cargo run -p vault-searchd -- code-index \
+  --root "$HOME/projects" \
+  --index "$HOME/.local/share/vault-search/projects-index.db" \
+  --embed-url http://127.0.0.1:8081/v1/embeddings \
+  --dim 768
+
+cargo run -p vault-searchd -- code-query \
+  --index "$HOME/.local/share/vault-search/projects-index.db" \
+  "where is the markdown chunker"
+```
+
 ## Vault sync (rclone)
 
 `crates/vault-rclone` wraps the `rclone` binary for `gdrive:Vault` only. It follows the vault note DriveSync Replacement: one vault folder, no whole-Drive sync, no mount, and no tokens in output. Commands: `status`, `check-config`, `lsf`, and guarded `sync` / `resync` (refuse when either side has fewer than `MIN_FILES` files, always `--max-delete`, newer-wins with `*.conflict-…` losers kept, run log in `~/.local/state/vault-rclone/sync.log`). After a successful, non-dry-run `sync` or `resync` it asks a running `vault-searchd` for an incremental reindex over the Unix socket (`{"op":"reindex"}`); if the daemon is not running or the reindex fails, that is logged and the sync still exits 0. On the desktop the daemon calls this library itself (`--sync-interval`); the bash `vault-sync` timer is not a second owner. Cutover notes are in [crates/vault-rclone/README.md](crates/vault-rclone/README.md).
