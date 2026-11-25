@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -216,8 +216,18 @@ impl Index {
                 .then_with(|| a.2.cmp(&b.2))
                 .then_with(|| a.1.cmp(&b.1))
         });
-        scored.truncate(k);
-        Ok(scored
+        // k is a note count. A second chunk of the same path must not crowd out another note.
+        let mut seen = HashSet::new();
+        let mut kept = Vec::new();
+        for item in scored {
+            if seen.insert(item.2.clone()) {
+                kept.push(item);
+                if kept.len() == k {
+                    break;
+                }
+            }
+        }
+        Ok(kept
             .into_iter()
             .map(|(score, _, path, heading, title, text)| Hit {
                 snippet: snippet(&text),
@@ -235,8 +245,52 @@ impl Index {
     }
 }
 
+/// `vault-searchd query` when `--k` is omitted. Nitro5.
+/// TowerX sets `VAULT_SEARCH_K_DEFAULT` on the daemon.
+pub const DAEMON_DEFAULT_K: u32 = 6;
+/// Hard cap for `vault-searchd query`. Nitro5.
+/// TowerX sets `VAULT_SEARCH_K_MAX` on the daemon.
+pub const DAEMON_MAX_K: u32 = 12;
+/// MCP `search` and the chat proxy when `k` is omitted. Nitro5.
+/// TowerX sets `VAULT_SEARCH_K_DEFAULT` on llama-server and the proxy.
+pub const MCP_DEFAULT_K: u32 = 4;
+/// MCP `search` and the chat proxy hard cap. Nitro5.
+/// TowerX sets `VAULT_SEARCH_K_MAX`.
+pub const MCP_MAX_K: u32 = 4;
+
+/// Apply an optional env override. Values below 1 are ignored.
+pub fn resolve_k_bounds(
+    builtin_default: u32,
+    builtin_max: u32,
+    default_env: Option<u32>,
+    max_env: Option<u32>,
+) -> (u32, u32) {
+    let max_k = max_env.filter(|n| *n >= 1).unwrap_or(builtin_max).max(1);
+    let default_k = default_env
+        .filter(|n| *n >= 1)
+        .unwrap_or(builtin_default)
+        .clamp(1, max_k);
+    (default_k, max_k)
+}
+
+pub fn k_bounds(builtin_default: u32, builtin_max: u32) -> (u32, u32) {
+    resolve_k_bounds(
+        builtin_default,
+        builtin_max,
+        env_u32("VAULT_SEARCH_K_DEFAULT"),
+        env_u32("VAULT_SEARCH_K_MAX"),
+    )
+}
+
 pub fn clamp_k(k: Option<u32>) -> usize {
-    k.unwrap_or(6).clamp(1, 12) as usize
+    let (default_k, max_k) = k_bounds(DAEMON_DEFAULT_K, DAEMON_MAX_K);
+    k.unwrap_or(default_k).clamp(1, max_k) as usize
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    let raw = std::env::var(name).ok()?;
+    let value = raw.trim().parse::<u32>().ok()?;
+    (value >= 1).then_some(value)
 }
 
 pub fn fit_dim(mut vector: Vec<f32>, dim: usize) -> Result<Vec<f32>, Error> {
@@ -252,8 +306,17 @@ pub fn fit_dim(mut vector: Vec<f32>, dim: usize) -> Result<Vec<f32>, Error> {
 }
 
 /// Character budget for text pasted into the chat model. About 1,000 tokens,
-/// so one tool result cannot fill an 8,192-token window.
+/// so one tool result cannot fill an 8,192-token window. Nitro5.
+/// TowerX sets `VAULT_SEARCH_RESULT_CHARS` on llama-server.
 pub const MODEL_RESULT_CHARS: usize = 4_000;
+
+pub fn model_result_limit() -> usize {
+    std::env::var("VAULT_SEARCH_RESULT_CHARS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 200)
+        .unwrap_or(MODEL_RESULT_CHARS)
+}
 
 pub fn format_hits(hits: &[Hit]) -> String {
     if hits.is_empty() {
@@ -471,6 +534,7 @@ mod tests {
         assert_eq!(hits[0].path, "Notes/A.md");
         assert!(hits[0].score > hits[1].score);
         assert_eq!(hits[0].snippet, "alpha");
+        assert_eq!(hits.len(), 2);
 
         let live = vec![
             Stamp {
@@ -488,6 +552,47 @@ mod tests {
     }
 
     #[test]
+    fn search_keeps_one_chunk_per_note() {
+        let (_dir, index) = temp_index(2);
+        let best = Chunk {
+            title: "P".into(),
+            heading: "A".into(),
+            text: "plan a".into(),
+        };
+        let other = Chunk {
+            title: "P".into(),
+            heading: "B".into(),
+            text: "plan b".into(),
+        };
+        let phone = Chunk {
+            title: "Phone".into(),
+            heading: "note4c".into(),
+            text: "phone".into(),
+        };
+        index
+            .upsert(
+                "Notes/plan.md",
+                1,
+                &[best, other],
+                &[vec![1.0, 0.0], vec![0.9, 0.1]],
+            )
+            .unwrap();
+        index
+            .upsert(
+                "Inventory/Phones/note4c.md",
+                1,
+                &[phone],
+                &[vec![0.8, 0.2]],
+            )
+            .unwrap();
+        let hits = index.search(&[1.0, 0.0], 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "Notes/plan.md");
+        assert_eq!(hits[0].text, "plan a");
+        assert_eq!(hits[1].path, "Inventory/Phones/note4c.md");
+    }
+
+    #[test]
     fn refuses_a_different_dimension_and_an_index_inside_the_vault() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
@@ -502,6 +607,30 @@ mod tests {
         let inside = vault.join("index.db");
         assert!(require_index_outside_vault(&vault, &inside).is_err());
         assert!(require_index_outside_vault(&vault, &dir.path().join("outside.db")).is_ok());
+    }
+
+    #[test]
+    fn k_bounds_stay_on_the_nitro_defaults_unless_overridden() {
+        assert_eq!(
+            resolve_k_bounds(DAEMON_DEFAULT_K, DAEMON_MAX_K, None, None),
+            (6, 12)
+        );
+        assert_eq!(resolve_k_bounds(MCP_DEFAULT_K, MCP_MAX_K, None, None), (4, 4));
+        assert_eq!(
+            resolve_k_bounds(MCP_DEFAULT_K, MCP_MAX_K, Some(10), Some(15)),
+            (10, 15)
+        );
+        assert_eq!(
+            resolve_k_bounds(DAEMON_DEFAULT_K, DAEMON_MAX_K, Some(10), Some(15)),
+            (10, 15)
+        );
+        assert_eq!(resolve_k_bounds(6, 12, Some(0), None), (6, 12));
+        assert_eq!(clamp_k(None), 6);
+        assert_eq!(clamp_k(Some(0)), 1);
+        assert_eq!(clamp_k(Some(12)), 12);
+        assert_eq!(clamp_k(Some(99)), 12);
+        assert_eq!(MODEL_RESULT_CHARS, 4_000);
+        assert_eq!(model_result_limit(), 4_000);
     }
 
     #[test]

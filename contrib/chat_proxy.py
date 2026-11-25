@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 HOST = os.environ.get("BIND", "127.0.0.1")
@@ -43,6 +43,9 @@ ZONE = ZoneInfo("Europe/Zurich")
 PATH_IN_TEXT = re.compile(
     r"(?<![\w./])((?:Notes|Daily|Inbox|System|Archive)/[^\s\]\)\"'<>]+?\.md)"
 )
+PATH_LINE = re.compile(r"(?m)^path: (.+)$")
+VAULT_MD_LINK = re.compile(r"\[[^\]]*\]\([^)]*?/vault/([^)\s]+)\)")
+BARE_VAULT_URL = re.compile(r"https?://[^\s)>\"]+/vault/([^\s)>\"]+)")
 
 CHAT_PATHS = {
     "/v1/chat/completions",
@@ -116,6 +119,9 @@ def source_link_block() -> str:
         "Example: path Daily/2026-10-31.md becomes "
         f"[2026-10-31]({PUBLIC_BASE}{VAULT_URL_PREFIX}Daily/2026-10-31.md)\n"
         "Do not add a Notes/ prefix. The path value is already from the vault root.\n"
+        "Each hit has an open: URL. That URL is the only link for that note. "
+        "Copy it unchanged. Do not invent a filename or change capitalization. "
+        "Spaces in that URL are already %20. Do not turn them back into spaces.\n"
         "End the answer with a Sources section, one link per path. "
         "Never invent a path."
     )
@@ -185,11 +191,32 @@ def search_socket() -> str:
     return f"/tmp/vault-search-{os.getuid()}.sock"
 
 
-def run_vault_search(query: str, k: int = 4) -> str:
+def search_k_bounds() -> tuple[int, int]:
+    """Nitro5 is 4 and 4. TowerX sets VAULT_SEARCH_K_DEFAULT and VAULT_SEARCH_K_MAX."""
+
+    def read(name: str, builtin: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return builtin
+        try:
+            value = int(raw)
+        except ValueError:
+            return builtin
+        return value if value >= 1 else builtin
+
+    maximum = max(1, read("VAULT_SEARCH_K_MAX", 4))
+    default = min(max(1, read("VAULT_SEARCH_K_DEFAULT", 4)), maximum)
+    return default, maximum
+
+
+def run_vault_search(query: str, k: int | None = None) -> str:
     query = query.strip()
     if not query:
         return "query is empty"
-    k = max(1, min(int(k), 4))
+    default, maximum = search_k_bounds()
+    if not k:
+        k = default
+    k = max(1, min(int(k), maximum))
     binary = os.environ.get(
         "VAULT_SEARCHD", str(Path.home() / ".local/bin/vault-searchd")
     )
@@ -259,6 +286,7 @@ def complete_with_tools(payload: dict, post, search, rounds: int = 3) -> dict:
     """Run vault_search when the model asks, then continue until a final answer."""
     messages = list(payload.get("messages") or [])
     result: dict = {}
+    used_paths: list[str] = []
     for _ in range(rounds):
         body = dict(payload)
         body["messages"] = messages
@@ -268,7 +296,7 @@ def complete_with_tools(payload: dict, post, search, rounds: int = 3) -> dict:
         calls = message.get("tool_calls") or []
         if not calls:
             if isinstance(message.get("content"), str):
-                message["content"] = ensure_source_links(message["content"])
+                message["content"] = apply_hit_links(message["content"], used_paths)
             return result
         messages.append(message)
         for call in calls:
@@ -283,7 +311,11 @@ def complete_with_tools(payload: dict, post, search, rounds: int = 3) -> dict:
             else:
                 args = raw_args
             if name == "vault_search":
-                text = search(str(args.get("query") or ""), args.get("k") or 4)
+                text = search(str(args.get("query") or ""), args.get("k") or None)
+                for rel in hit_paths(text):
+                    if rel not in used_paths:
+                        used_paths.append(rel)
+                text = annotate_hit_paths(text)
             else:
                 text = f"Unknown tool: {name}"
             messages.append(
@@ -338,8 +370,113 @@ def as_sse(result: dict) -> bytes:
     return "".join(lines).encode("utf-8")
 
 
+_VAULT_SPACED = re.compile(r"(/vault/)([^)\s\"'<>]*\s[^)\"'<>]*?\.md)")
+_MD_LINK = re.compile(r"(\[[^\]]*\])\(([^)]*)\)")
+
+
+def encoded_rel(rel: str) -> str:
+    return quote(unquote(rel.strip()), safe="/")
+
+
+def vault_url(rel: str) -> str:
+    """Absolute note URL. Spaces are %20 so a markdown link keeps the whole target."""
+    return f"{PUBLIC_BASE}{VAULT_URL_PREFIX}{encoded_rel(rel)}"
+
+
+def encode_link_destination(dest: str) -> str:
+    """Percent-encode a /vault/ path or a relative .md path. Leave other URLs alone."""
+    raw = dest.strip()
+    if raw.startswith("<") and raw.endswith(">"):
+        raw = raw[1:-1].strip()
+    idx = raw.find(VAULT_URL_PREFIX)
+    if idx >= 0:
+        head = raw[: idx + len(VAULT_URL_PREFIX)]
+        return head + encoded_rel(raw[idx + len(VAULT_URL_PREFIX) :])
+    if "://" in raw or not raw.endswith(".md"):
+        return dest
+    return encoded_rel(raw)
+
+
+def encode_vault_urls(text: str) -> str:
+    """Encode spaces in vault link targets so markdown does not cut the filename.
+
+    CommonMark ends a link destination at the first raw space, so
+    `[Madeira trip 2024-01](.../Madeira trip 2024-01.md)` renders as a link to
+    `.../Madeira` and leaves `trip 2024-01.md)` as plain text.
+    """
+
+    def repl_link(match: re.Match[str]) -> str:
+        dest = match.group(2)
+        if " " not in dest:
+            return match.group(0)
+        encoded = encode_link_destination(dest)
+        if encoded == dest:
+            return match.group(0)
+        return f"{match.group(1)}({encoded})"
+
+    def repl_bare(match: re.Match[str]) -> str:
+        return match.group(1) + encoded_rel(match.group(2))
+
+    text = _MD_LINK.sub(repl_link, text)
+    return _VAULT_SPACED.sub(repl_bare, text)
+
+
+def hit_paths(text: str) -> list[str]:
+    seen: list[str] = []
+    for raw in PATH_LINE.findall(text):
+        rel = raw.strip()
+        if rel and rel not in seen:
+            seen.append(rel)
+    return seen
+
+
+def annotate_hit_paths(text: str) -> str:
+    """Put the exact vault URL on the line after each path, for the model to copy."""
+
+    def repl(match: re.Match[str]) -> str:
+        rel = match.group(1).strip()
+        return f"path: {rel}\nopen: {vault_url(rel)}"
+
+    return PATH_LINE.sub(repl, text)
+
+
+def apply_hit_links(answer: str, paths: list[str]) -> str:
+    """Keep only /vault/ links that match a hit, and add any hit the reply omitted."""
+    answer = encode_vault_urls(answer)
+    if not paths:
+        return ensure_source_links(answer)
+    allowed = set(paths)
+
+    def drop_md(match: re.Match[str]) -> str:
+        rel = unquote(match.group(1))
+        return match.group(0) if rel in allowed else ""
+
+    def drop_url(match: re.Match[str]) -> str:
+        rel = unquote(match.group(1))
+        return match.group(0) if rel in allowed else ""
+
+    text = VAULT_MD_LINK.sub(drop_md, answer)
+    text = BARE_VAULT_URL.sub(drop_url, text)
+    for rel in paths:
+        encoded = encoded_rel(rel)
+        text = text.replace(f"]({encoded})", f"]({vault_url(rel)})")
+    missing = [
+        rel
+        for rel in paths
+        if f"{VAULT_URL_PREFIX}{encoded_rel(rel)}" not in text
+        and f"{VAULT_URL_PREFIX}{rel}" not in text
+    ]
+    if not missing:
+        return text
+    lines = ["", "Sources:"]
+    for rel in missing:
+        lines.append(f"- [{Path(rel).stem}]({vault_url(rel)})")
+    return text.rstrip() + "\n" + "\n".join(lines) + "\n"
+
+
 def ensure_source_links(text: str) -> str:
     """Add a Sources list when the reply names vault paths but no /vault/ link."""
+    text = encode_vault_urls(text)
     if VAULT_URL_PREFIX in text:
         return text
     seen: list[str] = []
@@ -351,7 +488,7 @@ def ensure_source_links(text: str) -> str:
     lines = ["", "Sources:"]
     for rel in seen:
         title = Path(rel).stem
-        lines.append(f"- [{title}]({PUBLIC_BASE}{VAULT_URL_PREFIX}{rel})")
+        lines.append(f"- [{title}]({vault_url(rel)})")
     return text.rstrip() + "\n" + "\n".join(lines) + "\n"
 
 
@@ -693,6 +830,86 @@ def self_test() -> None:
     assert seen == [("Daily/2026-10-30", 4)]
     assert "Daily/2026-10-30.md" in finished["choices"][0]["message"]["content"]
     assert "/vault/Daily/2026-10-30.md" in finished["choices"][0]["message"]["content"]
+
+    def fake_post_bad_link(body: dict) -> dict:
+        queries = [m for m in body["messages"] if m.get("role") == "tool"]
+        if not queries:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "vault_search",
+                                        "arguments": '{"query":"note4c"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        tool = queries[-1]["content"]
+        assert "open: " in tool
+        assert f"{PUBLIC_BASE}/vault/Inventory/Phones/note4c.md" in tool
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "No such phone. "
+                            f"[Note4]({PUBLIC_BASE}/vault/Inventory/Phones/Note4.md)"
+                        ),
+                    }
+                }
+            ]
+        }
+
+    guessed = complete_with_tools(
+        {"messages": [{"role": "user", "content": "tell me about note4c"}]},
+        fake_post_bad_link,
+        lambda query, k: "path: Inventory/Phones/note4c.md\nscore: 0.764\nSamsung Galaxy Note 4\n",
+    )
+    guessed_text = guessed["choices"][0]["message"]["content"]
+    assert "Note4.md" not in guessed_text
+    assert f"{PUBLIC_BASE}/vault/Inventory/Phones/note4c.md" in guessed_text
+    madeira = "Trips/Madeira trip 2024-01.md"
+    mallorca = "Trips/Mallorca trip 2023-08.md"
+    raw_sources = (
+        "Sources:\n"
+        f"- [Madeira trip 2024-01]({PUBLIC_BASE}/vault/{madeira})\n"
+        f"- [Mallorca trip 2023-08]({PUBLIC_BASE}/vault/{mallorca})\n"
+    )
+    fixed = apply_hit_links(raw_sources, [madeira, mallorca])
+    assert f"{PUBLIC_BASE}/vault/Trips/Madeira%20trip%202024-01.md" in fixed
+    assert f"{PUBLIC_BASE}/vault/Trips/Mallorca%20trip%202023-08.md" in fixed
+    assert "trip 2024-01.md)" not in fixed
+    assert "trip 2023-08.md)" not in fixed
+    for dest in re.findall(r"\]\(([^)]*)\)", fixed):
+        assert " " not in dest, dest
+    added = apply_hit_links("We went to Madeira.", [madeira])
+    assert f"{PUBLIC_BASE}/vault/Trips/Madeira%20trip%202024-01.md" in added
+    relative = apply_hit_links(
+        f"See [Madeira trip 2024-01]({madeira}).",
+        [madeira],
+    )
+    assert relative.count(f"{PUBLIC_BASE}/vault/Trips/Madeira%20trip%202024-01.md") == 1
+    assert f"]({madeira})" not in relative
+    bad = apply_hit_links(
+        f"See [Nope]({PUBLIC_BASE}/vault/Trips/Nope trip.md)",
+        [madeira],
+    )
+    assert "Nope" not in bad
+    assert "Madeira%20trip%202024-01.md" in bad
+    ann = annotate_hit_paths(f"path: {madeira}\n")
+    assert f"path: {madeira}" in ann
+    assert f"open: {PUBLIC_BASE}/vault/Trips/Madeira%20trip%202024-01.md" in ann
     linked = ensure_source_links("See Notes/nitro5.md for the host.")
     assert f"{PUBLIC_BASE}/vault/Notes/nitro5.md" in linked
     assert ensure_source_links(linked) == linked
@@ -715,6 +932,12 @@ def self_test() -> None:
         assert resolve_vault_file(root, "/vault/Daily/2026-10-31.md") == (
             daily / "2026-10-31.md"
         ).resolve()
+        trips = root / "Trips"
+        trips.mkdir()
+        (trips / "Madeira trip 2024-01.md").write_text("trip", encoding="utf-8")
+        assert resolve_vault_file(
+            root, "/vault/Trips/Madeira%20trip%202024-01.md"
+        ) == (trips / "Madeira trip 2024-01.md").resolve()
         assert resolve_vault_file(root, "/vault/Notes/../../secret.md") is None
         assert resolve_vault_file(root, "/vault/../secret.md") is None
         assert resolve_vault_file(root, "/health") is None

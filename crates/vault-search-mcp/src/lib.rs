@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
-use vault_search::{limit_model_text, roundtrip, IpcRequest, MODEL_RESULT_CHARS};
+use vault_search::{
+    k_bounds, limit_model_text, model_result_limit, roundtrip, IpcRequest, MCP_DEFAULT_K, MCP_MAX_K,
+};
 
 const PROTOCOL: &str = "2024-11-05";
 
@@ -19,20 +21,7 @@ pub fn dispatch(line: &str, socket: &Path) -> Result<Option<String>, String> {
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "vault-search", "version": "0.1.0"}
         }),
-        "tools/list" => json!({
-            "tools": [{
-                "name": "search",
-                "description": "Search the Obsidian vault by meaning and return a few short excerpts. The reply is capped at about 1000 tokens so it cannot fill the chat context. The vault root is fixed by the daemon. Do not pass a filesystem path.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Natural-language question"},
-                        "k": {"type": "integer", "description": "How many notes to consider. Default 4, maximum 4. The text cap may return fewer."}
-                    },
-                    "required": ["query"]
-                }
-            }]
-        }),
+        "tools/list" => json!({ "tools": [search_tool()] }),
         "ping" => json!({}),
         "tools/call" => call_tool(&msg, socket)?,
         _ => {
@@ -70,12 +59,13 @@ fn call_tool(msg: &Value, socket: &Path) -> Result<Value, String> {
             "isError": true
         }));
     }
+    let (default_k, max_k) = k_bounds(MCP_DEFAULT_K, MCP_MAX_K);
     let k = Some(
         args.get("k")
             .and_then(Value::as_u64)
             .map(|n| n as u32)
-            .unwrap_or(4)
-            .clamp(1, 4),
+            .unwrap_or(default_k)
+            .clamp(1, max_k),
     );
     match roundtrip(
         socket,
@@ -85,7 +75,7 @@ fn call_tool(msg: &Value, socket: &Path) -> Result<Value, String> {
         },
     ) {
         Ok(response) if response.ok => {
-            let text = limit_model_text(&response.text.unwrap_or_default(), MODEL_RESULT_CHARS);
+            let text = limit_model_text(&response.text.unwrap_or_default(), model_result_limit());
             Ok(json!({
                 "content": [{"type": "text", "text": text}],
                 "isError": false
@@ -100,6 +90,26 @@ fn call_tool(msg: &Value, socket: &Path) -> Result<Value, String> {
             "isError": true
         })),
     }
+}
+
+fn search_tool() -> Value {
+    let (default_k, max_k) = k_bounds(MCP_DEFAULT_K, MCP_MAX_K);
+    let result_chars = model_result_limit();
+    let description = format!(
+        "Search the Obsidian vault by meaning and return matching note excerpts. The reply is capped at {result_chars} characters. The vault root is fixed by the daemon. Do not pass a filesystem path."
+    );
+    json!({
+        "name": "search",
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural-language question"},
+                "k": {"type": "integer", "description": format!("How many notes to consider. Default {default_k}, maximum {max_k}. The text cap may return fewer.")}
+            },
+            "required": ["query"]
+        }
+    })
 }
 
 fn result_line(id: Option<Value>, result: Value) -> String {
@@ -144,6 +154,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(listed.contains("\"search\""));
+        assert!(listed.contains("Default 4, maximum 4"));
+        assert!(listed.contains("capped at 4000 characters"));
+        assert!(!listed.contains("1000 tokens"));
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

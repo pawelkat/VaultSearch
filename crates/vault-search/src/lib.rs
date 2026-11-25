@@ -16,8 +16,9 @@ pub use chunk::{
 };
 pub use error::Error;
 pub use index::{
-    clamp_k, fit_dim, format_hits, is_inside, limit_model_text, require_index_outside_vault, Hit,
-    Index, Plan, Stamp, MODEL_RESULT_CHARS,
+    clamp_k, fit_dim, format_hits, is_inside, k_bounds, limit_model_text, model_result_limit,
+    require_index_outside_vault, resolve_k_bounds, Hit, Index, Plan, Stamp, DAEMON_DEFAULT_K,
+    DAEMON_MAX_K, MCP_DEFAULT_K, MCP_MAX_K, MODEL_RESULT_CHARS,
 };
 pub use ipc::{
     roundtrip, roundtrip_with_timeout, IpcHit, IpcRequest, IpcResponse, IpcSyncStatus,
