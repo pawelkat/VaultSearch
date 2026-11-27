@@ -91,6 +91,9 @@ fn start_agent_opts(
         transfer: Default::default(),
         hub_wait: Duration::from_secs(8),
         catchup_debounce: Duration::from_millis(300),
+        caps: None,
+        caps_llama_url: "http://127.0.0.1:8080".into(),
+        caps_search_socket: std::env::temp_dir().join("vault-search-test.sock"),
     };
     let task = tokio::spawn(async move {
         agent::run(opts, Some(rx)).await.expect("agent");

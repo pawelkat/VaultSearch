@@ -817,6 +817,12 @@ pub struct AgentOpts {
     pub hub_wait: Duration,
     /// After the hub token reappears, wait this long before catching up.
     pub catchup_debounce: Duration,
+    /// When set, answer `vault/caps/<device>` for vault search only.
+    pub caps: Option<crate::caps::VaultCapsIdentity>,
+    /// Loopback llama-server base URL used by the caps probe.
+    pub caps_llama_url: String,
+    /// vault-searchd socket used by the caps probe.
+    pub caps_search_socket: PathBuf,
 }
 
 /// The agent's network side: session, outgoing blob cache, chunk settings.
@@ -1310,6 +1316,23 @@ pub async fn run(opts: AgentOpts, mut shutdown: Option<Shutdown>) -> Result<(), 
                 None
             }
         };
+    let _caps = match &opts.caps {
+        Some(identity) => {
+            let probe = crate::caps::CapsProbe {
+                llama_url: opts.caps_llama_url.clone(),
+                search_socket: opts.caps_search_socket.clone(),
+                timeout: Duration::from_secs(2),
+            };
+            match crate::caps::serve(&session, identity.clone(), probe).await {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    tracing::warn!("caps queryable not declared: {e}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     // Our outgoing cache answers chunk queries on its own task, so a long
     // catch-up or fetch in the loop below never stalls a puller.
     let blob_server = {

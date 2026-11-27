@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::io::Read;
 
-use vault_events::{ack, agent, blob, claims, event, hub, key, net, presence, vault};
+use vault_events::{ack, agent, blob, caps, claims, event, hub, key, net, presence, vault};
 
 #[derive(Parser)]
 #[command(
@@ -132,6 +132,39 @@ enum Cmd {
         /// Chunk size (bytes) for blob transfers.
         #[arg(long, env = "VAULT_EVENTS_CHUNK_SIZE", default_value_t = blob::DEFAULT_CHUNK_SIZE)]
         chunk_size: u64,
+        /// Advertise `vault/caps/<device>` for vault search. Omit to leave caps off.
+        /// This is the chat completions URL VaultHome will call.
+        #[arg(long)]
+        caps_endpoint: Option<String>,
+        /// Human label in the caps document.
+        #[arg(long)]
+        caps_label: Option<String>,
+        /// Human comment in the caps document.
+        #[arg(long)]
+        caps_comment: Option<String>,
+        /// Loopback llama-server used to read `ready` and `nCtx`.
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        caps_llama_url: String,
+        /// vault-searchd socket. Default: `$XDG_RUNTIME_DIR/vault-search.sock`.
+        #[arg(long)]
+        caps_search_socket: Option<PathBuf>,
+    },
+    /// Print one caps v2 document for vault search, after a live probe. Exits.
+    Caps {
+        /// Device id, for example `towerx`.
+        #[arg(long)]
+        device: String,
+        /// Chat completions URL.
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        comment: Option<String>,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        llama_url: String,
+        #[arg(long)]
+        search_socket: Option<PathBuf>,
     },
     /// Write (or delete) one note as a named writer: reads the content from
     /// stdin, writes it atomically, and leaves a claim so the running agent
@@ -306,6 +339,11 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
             no_bisync_marker,
             inline_max,
             chunk_size,
+            caps_endpoint,
+            caps_label,
+            caps_comment,
+            caps_llama_url,
+            caps_search_socket,
         } => {
             if !claims::valid_writer_name(&program) {
                 return Err(format!("--program {program:?}: use [A-Za-z0-9._-], max 32").into());
@@ -323,9 +361,10 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 bisync_marker_dir
                     .or_else(|| rclone_cfg.as_ref().map(vault_rclone::marker::marker_dir))
             };
+            let device_id = device.unwrap_or_else(default_device);
             let opts = agent::AgentOpts {
                 vault,
-                device: device.unwrap_or_else(default_device),
+                device: device_id.clone(),
                 state_dir: state_dir.unwrap_or_else(|| default_share().join("agent")),
                 connect,
                 max_bytes,
@@ -340,8 +379,43 @@ async fn run(cli: Cli) -> Result<(), net::BoxError> {
                 transfer: transfer_opts(inline_max, chunk_size),
                 hub_wait: Duration::from_secs(hub_wait_secs.max(1)),
                 catchup_debounce: Duration::from_millis(catchup_debounce_ms),
+                caps: match caps_endpoint {
+                    Some(endpoint) => Some(
+                        caps::identity(
+                            &device_id,
+                            &endpoint,
+                            caps_label.as_deref(),
+                            caps_comment.as_deref(),
+                        )
+                        .map_err(anyhow::Error::msg)?,
+                    ),
+                    None => None,
+                },
+                caps_llama_url,
+                caps_search_socket: caps_search_socket.unwrap_or_else(caps::default_search_socket),
             };
             agent::run(opts, None).await
+        }
+        Cmd::Caps {
+            device,
+            endpoint,
+            label,
+            comment,
+            llama_url,
+            search_socket,
+        } => {
+            let identity = caps::identity(&device, &endpoint, label.as_deref(), comment.as_deref())
+                .map_err(anyhow::Error::msg)?;
+            let live = caps::probe_vault_caps(&caps::CapsProbe {
+                llama_url,
+                search_socket: search_socket.unwrap_or_else(caps::default_search_socket),
+                timeout: Duration::from_secs(2),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&caps::vault_caps_document(&identity, &live))?
+            );
+            Ok(())
         }
         Cmd::Index {
             connect,

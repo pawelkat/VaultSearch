@@ -10,12 +10,14 @@
 //! - [`hub`]: embedded Zenoh router + storage queryables (+ Drive backup).
 //! - [`agent`]: `notify` watcher that publishes saves and applies events.
 //! - [`presence`]: liveliness tokens, `device online/offline`, `peers`.
+//! - [`caps`]: `vault/caps/<device>` JSON-LD for vault search.
 //!
 //! See the crate README for the topology and the box setup.
 
 pub mod ack;
 pub mod agent;
 pub mod blob;
+pub mod caps;
 pub mod claims;
 pub mod conflict;
 pub mod event;
