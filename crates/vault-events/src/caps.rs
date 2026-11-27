@@ -168,7 +168,9 @@ pub fn n_ctx_from_props(body: &[u8]) -> Option<u64> {
         .filter(|n| *n >= 1)
 }
 
-/// Answer `vault/caps/<device>`. Each query probes again. Dropping the guard stops it.
+/// Answer `vault/caps/<device>`. The device id is the one the agent was
+/// started with, so the same binary serves TowerX and Nitro. Each query
+/// probes again. Dropping the guard stops it.
 pub async fn serve(
     session: &Session,
     identity: VaultCapsIdentity,
@@ -176,6 +178,7 @@ pub async fn serve(
 ) -> Result<CapsGuard, BoxError> {
     let key = caps_key(&identity.device);
     let queryable = session.declare_queryable(&key).complete(true).await?;
+    let reply_key = key.clone();
     let task = tokio::spawn(async move {
         while let Ok(query) = queryable.recv_async().await {
             let identity = identity.clone();
@@ -188,7 +191,8 @@ pub async fn serve(
                 });
             let body =
                 serde_json::to_vec(&vault_caps_document(&identity, &live)).unwrap_or_default();
-            let _ = query.reply(query.key_expr().clone(), body).await;
+            // A wildcard query still comes back on this device's own key.
+            let _ = query.reply(reply_key.clone(), body).await;
         }
     });
     tracing::info!("caps queryable {key} (VaultSkill only)");
@@ -423,6 +427,80 @@ mod tests {
         assert_eq!(
             n_ctx_from_props(br#"{"default_generation_settings": {"n_ctx": 0}}"#),
             None
+        );
+    }
+
+    /// `vault/caps/**` must be answered on each configured device key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wildcard_query_is_answered_on_each_device_key() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen = format!("tcp/127.0.0.1:{port}");
+        let endpoint = std::slice::from_ref(&listen);
+        let _router = zenoh::open(crate::net::router_config(endpoint, &[]).unwrap())
+            .await
+            .unwrap();
+        let agent = zenoh::open(crate::net::client_config(endpoint).unwrap())
+            .await
+            .unwrap();
+        let querier = zenoh::open(crate::net::client_config(endpoint).unwrap())
+            .await
+            .unwrap();
+        let probe = CapsProbe {
+            llama_url: "http://127.0.0.1:9".into(),
+            search_socket: PathBuf::from("/tmp/vault-search-caps-key-test.sock"),
+            timeout: Duration::from_millis(50),
+        };
+        let devices = ["nitro5", "towerx"];
+        let mut _guards = Vec::new();
+        for device in devices {
+            let identity = identity(
+                device,
+                &format!("https://{device}.example/v1/chat/completions"),
+                None,
+                None,
+            )
+            .unwrap();
+            _guards.push(serve(&agent, identity, probe.clone()).await.unwrap());
+        }
+
+        let mut keys = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while keys.len() < devices.len() && tokio::time::Instant::now() < deadline {
+            keys.clear();
+            let replies = querier
+                .get("vault/caps/**")
+                .target(zenoh::query::QueryTarget::All)
+                .consolidation(zenoh::query::ConsolidationMode::None)
+                .timeout(Duration::from_secs(2))
+                .await
+                .unwrap();
+            while let Ok(reply) = replies.recv_async().await {
+                let sample = reply.result().unwrap();
+                let key = sample.key_expr().as_str().to_string();
+                let doc: Value = serde_json::from_slice(&sample.payload().to_bytes()).unwrap();
+                let device = doc["@graph"][0]["hostedOn"]["deviceId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(key, caps_key(&device));
+                keys.push(key);
+            }
+            keys.sort();
+            keys.dedup();
+            if keys.len() < devices.len() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        assert_eq!(
+            keys,
+            vec![
+                "vault/caps/nitro5".to_string(),
+                "vault/caps/towerx".to_string()
+            ]
         );
     }
 }
